@@ -59,6 +59,25 @@ int main(void)
     printf("BOARD,init_done\r\n");
 
     /*------------------------------------------------------------------
+     * 内核电压 1V2 配置
+     *
+     * PA5 经 R11(2MΩ) 注入外部 DC-DC 的反馈节点 DC1FB：
+     *   推挽输出高 -> 拉高 FB -> DC-DC 拉低输出 -> 1V2 最低
+     *   推挽输出低 -> 拉低 FB -> DC-DC 抬高输出 -> 1V2 最高
+     *----------------------------------------------------------------*/
+    {
+        GPIO_InitTypeDef vg = {0};
+
+        RCC_HB2PeriphClockCmd(RCC_HB2Periph_GPIOA, ENABLE);
+        vg.GPIO_Pin   = GPIO_Pin_5;
+        vg.GPIO_Mode  = GPIO_Mode_Out_PP;
+        vg.GPIO_Speed = GPIO_Speed_High;
+        GPIO_Init(GPIOA, &vg);
+
+        GPIO_SetBits(GPIOA, GPIO_Pin_5);        /* 1V2 最低 */
+    }
+
+    /*------------------------------------------------------------------
      * 1. 本核只负责【地磁】的初始化与使能
      *
      * 陀螺的初始化与使能由消费方（大核）自己做 —— 它必须先武装好自己的

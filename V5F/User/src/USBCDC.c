@@ -1,46 +1,53 @@
+/* USBHS CDC 双向串口（上行 EP2 bulk IN / 下行 EP2 bulk OUT），照搬 v2，仅键/LED 换脚 */
+
 #include "USBCDC.h"
 #include "ch32h417_usbhs_device.h"
 #include "usbd_compatibility_hid.h"
+#include "board_io.h"
+#include "debug.h"
 
-/* USBHS-HID ʹ�ܣ��Ƚ��� SWJ���������жϹ������ʼ���豸 */
 void usbhs_hid_enable(void)
 {
-    GPIO_PinRemapConfig(GPIO_Remap_SWJ_Disable, ENABLE);   /* �رյ��Կڣ�USBHS ��ռ */
-
-    RCC_HB2PeriphClockCmd(RCC_HB2Periph_GPIOC | RCC_HB2Periph_GPIOB, ENABLE);
     GPIO_InitTypeDef gpio = {0};
-    gpio.GPIO_Pin  = GPIO_Pin_9, gpio.GPIO_Mode = GPIO_Mode_IPU;
-    GPIO_Init(GPIOC, &gpio);
-    gpio.GPIO_Pin  = GPIO_Pin_11, gpio.GPIO_Mode = GPIO_Mode_Out_PP;
-    gpio.GPIO_Speed = GPIO_Speed_Low;
-    GPIO_Init(GPIOB, &gpio);
-    GPIO_SetBits(GPIOB, GPIO_Pin_11);    /* ��ʼ:�� = PF0 �� */
+
+    GPIO_PinRemapConfig(GPIO_Remap_SWJ_Disable, ENABLE);     /* 让出 PB8/PB9 给 USBHS */
+
+    RCC_HB2PeriphClockCmd(RCC_HB2Periph_GPIOF | RCC_HB2Periph_GPIOB, ENABLE);
+
+    gpio.GPIO_Pin  = KEY2_PIN;                              /* PF14 下载模式键 */
+    gpio.GPIO_Mode = GPIO_Mode_IPU;
+    GPIO_Init(KEY2_PORT, &gpio);
+
+    gpio.GPIO_Pin   = LED1_PIN;                             /* PB11 指示 LED */
+    gpio.GPIO_Mode  = GPIO_Mode_Out_PP;
+    gpio.GPIO_Speed = GPIO_Speed_High;
+    GPIO_Init(LED1_PORT, &gpio);
+    LED1_OFF();
 
     NVIC_SetAllocateIRQ(USBHS_IRQn, Core_ID_V5F);
     USBHS_Device_Init(ENABLE);
 }
 
-/* ��ѭ����ѯ��HID ���й��� + PC9 �ɿ��ص��δ����л� SWJ */
 void usbhs_hid_poll(void)
 {
-    static uint8_t trig_armed = 1;      /* ÿ���ϵ����һ��(�����ٻ�) */
-    static uint8_t key_prev    = 1;
+    static uint8_t trig_armed = 1;                          /* 每次上电只切一次，单向不回 */
+    static uint8_t key_prev   = 1;
 
     if (hid_up_avail())
         hid_up_flush();
 
-    hid_cmd_poll();                     /* ���У�������������������� */
+    hid_cmd_poll();
 
     if (trig_armed)
     {
-        uint8_t key_now = (GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_9) == RESET) ? 0 : 1;
-        if (key_prev == 0 && key_now == 1)
-        {
-            trig_armed = 0;
-            GPIO_WriteBit(GPIOB, GPIO_Pin_11, Bit_RESET);  /* PF0 ��(��) */
+        uint8_t key_now = KEY2_DOWN() ? 0u : 1u;
 
-            /* �̶����У���ʧ�� USBHS����ʹ�� SWJ(����������) */
-            USBHS_Device_Init(DISABLE);
+        if (key_prev == 0u && key_now == 1u)                /* PF14 按下再松开 */
+        {
+            trig_armed = 0u;
+            LED1_ON();
+
+            USBHS_Device_Init(DISABLE);                     /* 先失能 USBHS 让出 PB8/PB9 */
             GPIO_PinRemapConfig(GPIO_Remap_SWJ_Disable, DISABLE);
         }
         key_prev = key_now;

@@ -21,6 +21,8 @@
 #include "mipc_shm.h"
 #include "sensor_dma.h"
 #include "sdmmc_sd.h"      /* SD_Init / SD_ReadDisk / SD_WriteDisk */
+#include "USBCDC.h"
+#include "cdc_report.h"
 
 /*==============================================================================
  * 全速采集 -> 写 TF 卡 -> 读回 -> 串口转发
@@ -32,12 +34,16 @@
  * 帧格式（自同步，PC 端可断流重同步）：
  *   A5 5A | TYPE | LEN | CNT(4) | 净荷 | CHK(XOR)
  *   TYPE 1=IMU 2=MMC 3=BMP 4=EOF
- /*/
+ */
 #define SD_LOG_START_SECTOR     4096u       // 2MB 偏移
 #define SD_LOG_PAD_BYTES        512u        // 前 512B 作校验暂存，同时保证 16B 对齐
 #define SD_LOG_MAX_SECTORS      512u        // 单次最多 256KB
 #define SD_FLUSH_WATERMARK      (224u * 1024u)
 #define SD_CAPTURE_US           (15ULL * 1000000ULL)
+
+/* SD 日志（采集->写卡->回放）开关。USB CDC 使能后 USART1 让位，故默认关闭；
+ * 置 1 时需在 main 里重新调用 capture_loop() + replay_to_uart()。 */
+#define V5F_SD_LOG_EN           0u
 
 #define REC_HEAD_SZ             8u          // SYNC(2) TYPE(1) LEN(1) CNT(4)
 #define IMU_PAYLOAD_SZ          18u         // ts_lo(4) + 7 * int16
@@ -122,6 +128,7 @@ static uint32_t s_sec_nbad;             /* 写后读回校验失败次数 */
 static uint32_t s_lo;                   /* 本批次原始记录字节的起点（上界用 s_fill） */
 static uint32_t s_pend;                 /* 本次待写入的扇区数 */
 
+#if (V5F_SD_LOG_EN)
 // 打包：把 s_lo..s_fill 的原始记录字节切成 496B 一段，每段前面加 16B 头。
 // 从后往前处理，这样目标位置永远不小于源位置，不会覆盖未处理的数据。
 static void sd_pack_all(void)
@@ -320,6 +327,8 @@ static void replay_to_uart(void)
 }
 
 
+#endif /* V5F_SD_LOG_EN */
+
 int main(void)
 {
     uint32_t last_imuc = 0u;
@@ -362,38 +371,10 @@ int main(void)
     printf("[V5F] Ready.\r\n");
 
     /*--------------------------------------------------------------------------
-     * 全速采集 -> 写 TF 卡 -> 读回 -> 串口转发
-     *
-     * 采集期间不打印（二进制流里混文本会让 PC 端无法解析）。
-     * 回放前后各打一行文本标记，PC 端据此切换"文本/二进制"模式。
+     * USBHS CDC 上报（使能后 USART1 让位，数据走 CDC 上行）
      *------------------------------------------------------------------------*/
-    SD_GPIO_Init();
-    if (SD_Init() == SD_OK)
-    {
-        s_lo          = SD_LOG_PAD_BYTES;   /* 记录区从 pad 之后开始 */
-        s_fill        = SD_LOG_PAD_BYTES;
-        s_log_sectors = 0u;
-        s_records     = 0u;
-        s_sec_seq     = 0u;
-        s_sec_nbad    = 0u;
-        s_pend        = 0u;
-
-        t_cap0 = GetTime64_Us();
-        capture_loop((uint32_t)SD_CAPTURE_US);
-
-        printf("[V5F] capture done: sectors=%u records=%u verify_bad=%u\r\n",
-               (unsigned)s_log_sectors, (unsigned)s_records, (unsigned)s_sec_nbad);
-        printf("CAPDUR,us=%u\r\n", (unsigned)(GetTime64_Us() - t_cap0));
-        /* 回放的是「每扇区 496 字节有效数据」，故长度按扇区数 × 496 报 */
-        printf("BIN,%u\r\n", (unsigned)(s_log_sectors * SD_SEC_DATA));
-        replay_to_uart();
-        printf("\r\nBIN_END\r\n");
-    }
-    else
-    {
-        printf("[V5F] SD_Init FAIL\r\n");
-    }
-
+    cdc_reset_seq();
+    usbhs_hid_enable();
     /*--------------------------------------------------------------------------
      * 主循环：每秒打印一次
      *------------------------------------------------------------------------*/
@@ -401,6 +382,9 @@ int main(void)
 
     for (;;)
     {
+        usbhs_hid_poll();
+        cdc_rx_poll();
+
         if ((int64_t)(t_next - GetTime64_Us()) <= 0)
         {
             uint32_t ic = g_shm->imu.hdr.cnt;
@@ -452,6 +436,20 @@ int main(void)
                            (unsigned)n, (unsigned)avg, (unsigned)mx, (unsigned)ovr,
                            (unsigned)(load / 100u), (unsigned)(load % 100u));
                 }
+            }
+
+            {
+                uint8_t pl[PL_STAT];
+                uint32_t v;
+                v = g_cdc_tx_pkts;
+                pl[0]=(uint8_t)v; pl[1]=(uint8_t)(v>>8); pl[2]=(uint8_t)(v>>16); pl[3]=(uint8_t)(v>>24);
+                v = g_cdc_tx_drop;
+                pl[4]=(uint8_t)v; pl[5]=(uint8_t)(v>>8); pl[6]=(uint8_t)(v>>16); pl[7]=(uint8_t)(v>>24);
+                v = g_shm->imu_start_cnt;
+                pl[8]=(uint8_t)v; pl[9]=(uint8_t)(v>>8); pl[10]=(uint8_t)(v>>16); pl[11]=(uint8_t)(v>>24);
+                v = g_shm->mmc_start_cnt;
+                pl[12]=(uint8_t)v; pl[13]=(uint8_t)(v>>8); pl[14]=(uint8_t)(v>>16); pl[15]=(uint8_t)(v>>24);
+                (void)cdc_send(PKT_TYPE_STAT, PKT_FLAG_TSOK, GetTime64_10Ns(), pl, PL_STAT);
             }
 
             t_next = GetTime64_Us() + 1000000ULL;
