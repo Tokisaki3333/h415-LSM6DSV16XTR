@@ -1,0 +1,89 @@
+# =============================================================================
+#  CH32H417 串口陀螺仪 (IMU) —— MounRiver Studio 2 / Eclipse CDT-RISC-V / WCH 工具链
+#  双核工程：V3F（小核，传感器采集） + V5F（大核） + Common（双核共享），另含 LVGL。
+#
+#  改动本文件前务必先读这三条硬约束：
+#   1) 本文件不支持"行尾注释"：模式必须独占一行，行内的 # 会被当作模式的一部分，
+#      写成 "obj/   # 说明" 会导致整行失效（构建产物会重新冒出来）。
+#   2) 工程内存在"名字像构建产物"的真实源码目录（Common/Debug/debug.c、debug.h，
+#      且 V3F/V5F 以链接文件夹 Debug 引用它们），因此绝不使用裸 Debug/ 、Release/ 规则。
+#   3) Windows 文件系统不区分大小写，git 的忽略匹配随之不区分大小写，
+#      形如 *.s 的规则会连带命中 Common/Startup/startup_ch32h417_*.S 汇编源码，
+#      故汇编相关后缀一律不列入忽略。
+#
+#  实际构建输出统一落在各工程根目录下的 obj/（MounRiver 实测结构：
+#  V3F/obj、V5F/obj 下按源码目录分层存放 *.o / *.d，根下另有
+#  CH32串口陀螺仪_V3F|V5F.elf/.hex/.bin/.map/.lst 与 V5F/obj/Merge.bin）。
+# =============================================================================
+
+# ------------------------- 构建输出：MounRiver / Eclipse CDT -------------------------
+# 工程构建树（含多级子目录，如 V5F/obj/User/src/SPI_rx.o）
+obj/
+*.o
+*.d
+*.su
+*.elf
+*.hex
+*.srec
+*.bin
+*.map
+*.lst
+*.i
+*.ii
+
+# Eclipse 在"工程根"生成的构建脚本；源码里真实存在的 *.mk / CMakeLists.txt / Kconfig 不受影响
+/*/makefile
+/*/objects.mk
+/*/sources.mk
+
+# ------------------------- MounRiver Studio 工作区状态 -------------------------
+# MRS 工作区状态目录（.mrs/*.mrs-workspace，内含本机绝对路径）
+.mrs/
+*.wvproj.bak
+*.wvproj.user
+*.launch.bak
+
+# 以下文件属工程本体，必须入库，切勿加入忽略：
+#   CH32串口陀螺仪.wvsln
+#   V3F/ V5F/ 下的 *.wvproj、.cproject、.project、.kernel、.template、*.launch
+
+# ------------------------- Eclipse 工程/工作区元数据 -------------------------
+.settings/
+.metadata/
+.externalToolBuilders/
+.cache/
+
+# ------------------------- 操作系统 / 编辑器杂项 -------------------------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.rej
+
+# ------------------------- 脚本与打包残留 -------------------------
+__pycache__/
+*.pyc
+*.log
+*.zip
+*.7z
+*.rar
+
+# ------------------------- raw capture / analysis data (not tracked) -------------------------
+serial_runtime_*.txt
+static_*.bin
+*.npy
+
+# 分析脚本产出的图（随时可重生）
+accel_ellipse_static.png

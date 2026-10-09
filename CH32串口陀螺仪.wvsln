@@ -1,0 +1,11 @@
+C:\Users\11038\mounriver-studio-projects\CH32串口陀螺仪\CH32串口陀螺仪.wvsln:
+BuildOrder=CH32串口陀螺仪_V3F,CH32串口陀螺仪_V5F
+-arm:${eclipse_home}\toolchain\arm-none-eabi-gcc\bin
+-build:${eclipse_home}\toolchain\Build Tools\bin
+-openocd name:openocd.exe
+-openocd path:${eclipse_home}\toolchain\OpenOCD\bin
+-rv:${eclipse_home}\toolchain\RISC-V Embedded GCC\bin
+C:\Users\11038\mounriver-studio-projects\CH32串口陀螺仪\V3F
+..\V3F
+C:\Users\11038\mounriver-studio-projects\CH32串口陀螺仪\V5F
+..\V5F
