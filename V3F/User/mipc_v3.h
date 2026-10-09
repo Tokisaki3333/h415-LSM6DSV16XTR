@@ -5,12 +5,12 @@
 #include "debug.h"
 #include "mipc_shm.h"
 
-/* ¹²ÏíÇøÖ¸Õë£¨V3F ¶¨Òå storage£¬g_shm Ö¸ÏòËü£»µØÖ·¾­ IPC_MSG0 ´«¸ø V5F£¬Á½¶ËÍ¬ÃûÍ¬ĞÍ£©
- * Í¨µÀ£ºv5f_progress=ÎÕÊÖ¡¢v3f_cfg_done=IMU ÅäÖÃÍê³É¡¢log=µÍÆµÎÄ±¾¡¢
- *       gyro/ist/bmp=Èı¸ö´«¸ĞÆ÷£¨ÏÈĞ´Êı¾İ¡úÔÙĞ´ DRDY Ê±¼ä´Á¡úcnt++ ·¢²¼£©*/
+/* å…±äº«åŒºæŒ‡é’ˆï¼ˆV3F å®šä¹‰ storageï¼Œg_shm æŒ‡å‘å®ƒï¼›åœ°å€ç» IPC_MSG0 ä¼ ç»™ V5Fï¼Œä¸¤ç«¯åŒååŒå‹ï¼‰
+ * é€šé“ï¼šv5f_progress=æ¡æ‰‹ã€v3f_cfg_done=IMU é…ç½®å®Œæˆã€log=ä½é¢‘æ–‡æœ¬ã€
+ *       gyro/ist/bmp=ä¸‰ä¸ªä¼ æ„Ÿå™¨ï¼ˆå…ˆå†™æ•°æ®â†’å†å†™ DRDY æ—¶é—´æˆ³â†’cnt++ å‘å¸ƒï¼‰*/
 extern volatile shared_mem_t *g_shm;
 
 uint8_t ipc_comm_init(void);
-void    mipc_v3_printf(const char *fmt, ...);  /* printf-like: Ğ´ log Í¨µÀ data_buf & cnt++ */
+void    mipc_v3_printf(const char *fmt, ...);  /* printf-like: å†™ log é€šé“ data_buf & cnt++ */
 
 #endif

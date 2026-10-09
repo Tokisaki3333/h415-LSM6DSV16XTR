@@ -2,20 +2,20 @@
 
 #include <stdarg.h>
 
-/* ¹²ÏíÇø´æ´¢ + Ö¸Õë£ºÁ½¶ËÍ³Ò»ÒÔ g_shm£¨Ö¸Õë£©ÃüÃû£¬µØÖ·¾­ IPC_MSG0 ´«¸ø V5F */
+/* å…±äº«åŒºå­˜å‚¨ + æŒ‡é’ˆï¼šä¸¤ç«¯ç»Ÿä¸€ä»¥ g_shmï¼ˆæŒ‡é’ˆï¼‰å‘½åï¼Œåœ°å€ç» IPC_MSG0 ä¼ ç»™ V5F */
 volatile shared_mem_t  g_shm_storage = {0};
 volatile shared_mem_t *g_shm = &g_shm_storage;
 
-/* printf ·ç¸ñ·¢ĞÅ£¨Ğ¡ºË¡ú´óºË£©£ºlog Í¨µÀµ¥»º³å£¬ÎŞÆ¹ÅÒ£¨Ğ¡ºËµÍÆµ¡¢ÑÏ¸ñË³Ğò£©
- * ·¢²¼Ğ­Òé£ºĞ´ data_buf ¡ú ÆÁÕÏ ¡ú cnt++£¨´óºË¶Á¶Ë¼û mipc_shm.h ×¢ÊÍ£©*/
+/* printf é£æ ¼å‘ä¿¡ï¼ˆå°æ ¸â†’å¤§æ ¸ï¼‰ï¼šlog é€šé“å•ç¼“å†²ï¼Œæ— ä¹’ä¹“ï¼ˆå°æ ¸ä½é¢‘ã€ä¸¥æ ¼é¡ºåºï¼‰
+ * å‘å¸ƒåè®®ï¼šå†™ data_buf â†’ å±éšœ â†’ cnt++ï¼ˆå¤§æ ¸è¯»ç«¯è§ mipc_shm.h æ³¨é‡Šï¼‰*/
 void mipc_v3_printf(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
     vsnprintf((char *)g_shm->log.data_buf, sizeof(g_shm->log.data_buf), fmt, ap);
     va_end(ap);
-    __sync_synchronize();       /* Êı¾İĞ´ÍêÔÙ·¢²¼£¬·À´óºË¶Áµ½ĞÂ cnt Åä¾ÉÊı¾İ */
-    g_shm->log.cnt++;           /* Í¨Öª´óºË£ºĞÂÒ»Ö¡¾ÍĞ÷ */
+    __sync_synchronize();       /* æ•°æ®å†™å®Œå†å‘å¸ƒï¼Œé˜²å¤§æ ¸è¯»åˆ°æ–° cnt é…æ—§æ•°æ® */
+    g_shm->log.cnt++;           /* é€šçŸ¥å¤§æ ¸ï¼šæ–°ä¸€å¸§å°±ç»ª */
 }
 
 static void IPC_Config(IPC_Channel_TypeDef IPC_CHx, IPC_TxCID_TypeDef IPC_TxCIDx, IPC_RxCID_TypeDef IPC_RxCIDx)
@@ -36,7 +36,7 @@ uint8_t ipc_comm_init(void)
     IPC_DeInit();
     IPC_Config(IPC_CH0, IPC_TxCID1, IPC_RxCID0);
     IPC_CH0_Lock();
-    IPC_WriteMSG(IPC_MSG0, (uint32_t)g_shm);   /* ¹²ÏíÇøµØÖ· */
+    IPC_WriteMSG(IPC_MSG0, (uint32_t)g_shm);   /* å…±äº«åŒºåœ°å€ */
     printf("[V3F] ipc addr written\r\n");
 
     NVIC_WakeUp_V5F(Core_V5F_StartAddr);            // wake up V5

@@ -114,12 +114,7 @@
 				"post_script_description": "",
 				"excludeResources": [
 					"${project}/Startup/startup_ch32h417_v3f.S",
-					"${project}/Common/board.c",
-					"${project}/Common/board.h",
-					"${project}/Common/LVGL",
-					"${project}/Common/spi_hw.c",
-					"${project}/Common/spi_hw.h",
-					"${project}/User/src/SPI_rx.c"
+					"${project}/User/src/sensor_dma_rx.c"
 				],
 				"optimization": {
 					"level": "fast",
@@ -209,8 +204,7 @@
 							"${project}/User",
 							"${project}/User/inc",
 							"${project}/Peripheral/inc",
-							"${project}/Common",
-							"${project}/Common/LVGL",
+							"${project}/Common"
 							"${project}/USBHS"
 						],
 						"include_system_paths": [],

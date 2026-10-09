@@ -10,6 +10,9 @@
 #include "mmc5983ma_reg.h"  /* MMC5983MA_REG_* / CTRL0_* / XYZ_* 解码宏 */
 #include "mmc5983.h"        /* MMC_RST_PULSE_WAIT_US：脉冲后的等待 */
 #include "lsm6dsv16x_reg.h"  /* LSM6DSV16X_REG_OUT_TEMP_L_BLK：陀螺输出块 */
+#include "lsm6dsv16x.h"      /* LSM6_ERR_*：陀螺初始化/使能的返回码 */
+#include "sensor_dma.h"      /* SENSOR_IMU_FRAME_LEN / READ_CMD：陀螺 TX 帧长 */
+#include "mipc_shm.h"        /* shm_publish_mmc：地磁结果发布到共享区 */
 
 /*==============================================================================
  * 软件 I2C 时序：~200kHz
@@ -30,26 +33,8 @@ void BMP_I2C_SCL_LOW(void)  { GPIO_ResetBits(BMP_I2C_PORT, BMP_I2C_SCL_PIN); }
 void BMP_I2C_SDA_HIGH(void) { GPIO_SetBits(BMP_I2C_PORT, BMP_I2C_SDA_PIN); }
 void BMP_I2C_SDA_LOW(void)  { GPIO_ResetBits(BMP_I2C_PORT, BMP_I2C_SDA_PIN); }
 
-/* 板上无外部上拉：需要"高"的时候必须把引脚切到上拉输入，
- * 才能让内部上拉把线抬起来；否则开漏 + 无上拉 = 浮空。 */
-static void bmp_i2c_pin_mode(uint16_t pin, GPIOMode_TypeDef mode)
-{
-    GPIO_InitTypeDef g = {0};
-    g.GPIO_Pin   = pin;
-    g.GPIO_Speed = GPIO_Speed_Low;
-    g.GPIO_Mode  = mode;
-    GPIO_Init(BMP_I2C_PORT, &g);
-}
-
-void BMP_I2C_SDA_TO_RX(void) { bmp_i2c_pin_mode(BMP_I2C_SDA_PIN, GPIO_Mode_IPU); }
-void BMP_I2C_SDA_TO_TX(void) { bmp_i2c_pin_mode(BMP_I2C_SDA_PIN, GPIO_Mode_Out_OD); }
-
-void BMP_I2C_BUS_IDLE(void)
-{
-    bmp_i2c_pin_mode(BMP_I2C_SCL_PIN, GPIO_Mode_IPU);
-    bmp_i2c_pin_mode(BMP_I2C_SDA_PIN, GPIO_Mode_IPU);
-}
-
+/* PF0/PF1 有【外部上拉】：网表 PF0 ; R34.2 U1.39 U3.2、PF1 ; R36.2 U1.40 U3.4。
+ * 所以开漏输出 + GPIO_SetBits(释放) 就能得到正确的高电平，无需切上拉输入。 */
 uint8_t BMP_I2C_SDA_READ(void)
 {
     return (GPIO_ReadInputDataBit(BMP_I2C_PORT, BMP_I2C_SDA_PIN) != 0) ? 1 : 0;
@@ -89,28 +74,9 @@ void BOARD_GPIO_Init(void)
     IMU_CS_HIGH();
 #endif
 
-    /*--------------------------------------------------------------------------
-     * --- 中断输入：磁强计 INT(PE1) + IMU INT1(PD11) ---
-     *
-     * ★ 配【浮空输入】—— 不加任何内部上下拉
-     *
-     * 【依据】这两个脚都是【器件输出】：
-     *   手册 P9 ：pin15 = INT，类型栏是 `O`（Output）
-     *   手册 P11："INT – This pin is Interrupt output. Active High."
-     * 板上没有外部上下拉（网表：PE1 ; U1.64 U11.15，只有两个器件引脚）。
-     * 器件自己会驱动这个脚，MCU 侧不该并接上下拉去和它抢。
-     *
-     * 【实测对照 —— 这一项试过三种，结论明确】
-     *   ✗ 内部上拉：引脚被读成恒低。上拉把器件输出的高电平压下来，
-     *               两边对着拉，电平不可信。（本次实测 edges=0, hi=0）
-     *   ✗ 内部下拉：把器件输出直接拽到低，更错
-     *   ✓ 浮空    ：让器件自己驱动。实测读到 pe1=1、且能采到跳变
-     *
-     * 规律：给一个【器件输出】的脚加内部上下拉，等于并行加载它的输出级，
-     * 只会让电平失真。只有开漏输出才需要外部/内部上拉。
-     *
-     * 注：PD10 是 IMU 的 CS（输出），在 BOARD_SPI2_IMU_Init 里配置。
-     *------------------------------------------------------------------------*/
+    /* 中断输入：地磁 INT(PE1) + 陀螺 INT1(PD11)，均为【浮空输入】。
+     * 这两个是器件输出（手册 P9 pin15 类型 O、P11 "Active High"），
+     * 板上有外部上拉，内部再拉会与器件输出级对拉、电平失真。 */
     g.GPIO_Pin   = MMC_DRDY_PIN;
     g.GPIO_Mode  = GPIO_Mode_IN_FLOATING;
     GPIO_Init(MMC_DRDY_PORT, &g);
@@ -167,20 +133,8 @@ void BOARD_SPI1_MMC_Init(void)
     s.SPI_Mode              = SPI_Mode_Master;
     s.SPI_DataSize          = SPI_DataSize_8b;
 
-    /*--------------------------------------------------------------------------
-     * SPI 模式：Mode 0（CPOL=Low, CPHA=1Edge）
-     *
-     * 【为什么回退到 Mode 0】
-     * 我一度按手册 P5 的 "SCK is stopped HIGH when CS is high" 判成 CPOL=1，
-     * 改成 Mode 3。结果实测立即变差：
-     *   Mode 0 时：RD 数据真实稳定（SET/RESET 极性正确翻转、零偏 80 周期收敛）
-     *   Mode 3 时：数据冻结不变、数值非法（y≈1580）、测量周期从 1ms 变 7ms
-     * 说明器件要的是 Mode 0。
-     *
-     * 手册那句描述的是"CS 为高时 SCK 停在高电平"这一【状态】，
-     * 不代表 SPI 的 CPOL 定义 —— 是我理解错了。
-     * 实测才是判据。
-     *------------------------------------------------------------------------*/
+    /* Mode 0。手册 P5 的 "SCK is stopped HIGH when CS is high" 描述的是空闲
+     * 【状态】而非 CPOL 定义；实测 Mode 3 下数据冻结、数值非法且周期变 7ms。 */
     s.SPI_CPOL              = SPI_CPOL_Low;          /* mode 0 */
     s.SPI_CPHA              = SPI_CPHA_1Edge;
 
@@ -188,27 +142,11 @@ void BOARD_SPI1_MMC_Init(void)
     s.SPI_FirstBit          = SPI_FirstBit_MSB;      /* MMC5983MA: MSB first */
     s.SPI_CRCPolynomial     = 7;
 
-    /*--------------------------------------------------------------------------
-     * SCK 频率 = 6.25 MHz（FHCLK/16，BR=011，HSRXEN=0）
-     *
-     * 【为什么定在 6.25MHz —— 实测结论，不要再改】
-     * 器件手册 P4：fc(SCK) max = 10 MHz、tc(SCK) min = 100ns。
-     * 本板实测（用示波器量 SCK 周期校准过）：
-     *   BR=011(/16) 6.25MHz + Mode 0  ->  正常：mmc_hz≈1027、极性交替、零偏收敛
-     *   BR=010(/8)  12.5MHz + Mode 0  ->  器件完全不测量（m_done 置起但 INT 恒低、hz=0）
-     *   BR=010(/8)  12.5MHz + Mode 3  ->  能跑但全错：hz 掉到 128、raw 数值非法、
-     *                                     极性不再交替
-     * 说明 MMC5983MA 只接受 Mode 0，且 12.5MHz 超出它的时序裕量。
-     * HSRXEN=1 那一套的 /9=11.1MHz（超手册 11%）未再尝试 ——
-     * 6.25MHz 对本路不构成瓶颈，没必要为它冒险。
-     *
-     * 【6.25MHz 为何够用】地磁每秒 1027 拍 × 19 字节 ≈ 19.5 KB/s，
-     *   19 字节在 6.25MHz 下只需约 30us，占 973us 周期的 3%。
-     *   瓶颈是器件的转换时间（BW=11 约 500us），不是 SPI 带宽。
-     *   陀螺那一路（SPI2）单独跑 12.5MHz，与这里互不影响。
-     *
-     * 【注意】BR[2:0] 在通讯过程中不可修改（参考手册明确要求）；
-     * spi_dma_rx_suspend/resume 只动 CTLR2 的 DMA 请求位，不碰 BR，符合该约束。*/
+    /* SCK = FHCLK/16 = 6.25 MHz（BR=011，HSRXEN=0）。
+     * 手册 P4：fc(SCK) max 10MHz。实测 12.5MHz 下器件完全不测量（Mode 0）
+     * 或数据全错（Mode 3），故不超频。本路带宽非瓶颈（19 字节约 30us，
+     * 占 973us 周期的 3%；瓶颈是器件转换时间）。
+     * BR[2:0] 通讯中不可修改；CTLR2 的 DMA 请求位改动不涉及 BR。*/
     s.SPI_BaudRatePrescaler = SPI_BaudRatePrescaler_Mode3;   /* BR=011 = /16 = 6.25MHz */
     SPI_Init(MMC_SPI, &s);
 
@@ -379,9 +317,8 @@ void BOARD_CAN1_Init(void)
  * 9.7 SD 卡 —— SDMMC 默认映射 RM=00
  *     D0=PC8  D1=PC9  D2=PC10  D3=PC11  CK=PC12  CMD=PD2  STR=PD3
  *     D4=PA14 D5=PA15 D6=PC6   D7=PC7（8bit 才用）
- *     要点（照 EVT SDMMC_SD 例程）：
- *       - SDMMC 引脚只做 GPIO 复用配置，不调用 GPIO_PinAFConfig
- *       - 需先设 VIO18 为软件可配模式，否则 SD 电平不受控
+ *     要点（照 EVT SDMMC_SD 例程）：SDMMC 引脚只做 GPIO 复用配置，
+ *     不调用 GPIO_PinAFConfig；需先设 VIO18 为软件可配模式。
  *============================================================================*/
 void BOARD_SDMMC_PinInit(void)
 {
@@ -452,12 +389,9 @@ void BOARD_SDMMC_PinInit(void)
 }
 
 /*==============================================================================
- * 9.8 EXTI：磁强计 DRDY(PE1->EXTI1) + IMU INT1(PD11->EXTI11)
- *                              IMU INT2(PD10->EXTI10)
- *     向量归属（startup_ch32h417_v*.S 中的弱符号）：
- *       EXTI7_0_IRQHandler   <- PE1
- *       EXTI15_8_IRQHandler  <- PD11 / PD10
- *     NVIC 分配给哪个核由应用层决定（NVIC_SetAllocateIRQ），此处只配置外设。
+ * 9.8 EXTI 配置（只配外设；NVIC 归核由 main.c 的 NVIC_SetAllocateIRQ 决定）
+ *     地磁 DRDY = PE1 -> EXTI_Line1  -> EXTI7_0_IRQHandler
+ *     陀螺 INT1 = PD11 -> EXTI_Line11 -> EXTI15_8_IRQHandler
  *============================================================================*/
 void BOARD_EXTI_Init(void)
 {
@@ -465,22 +399,9 @@ void BOARD_EXTI_Init(void)
 
     RCC_HB2PeriphClockCmd(RCC_HB2Periph_AFIO, ENABLE);
 
-    /* --- 地磁 MMC5983MA INT = PE1 ---
-     * 【上升沿】触发 —— 手册 P11 的 "Active High" 是对的。
-     *
-     * 实测过程（供后人别再走弯路）：
-     *   器件中断功能【未使能】前，INT 引脚是 hi-Z（手册原文），
-     *   所以那时读到的电平只反映 MCU 侧配置，不是器件在驱动：
-     *     浮空/上拉 -> 读到高 ；下拉 -> 读到低
-     *   我把这些"MCU 自己造成的电平"误当成器件极性，先后把触发沿
-     *   改成下降沿、把引脚改成上拉，全错。
-     *
-     *   直到 INTERRUPT 真正使能（INT_meas_done_en 写进去）后，
-     *   实测 INT 变为【恒高】—— 器件在自己的空闲态输出高、断言时驱动，
-     *   这才是器件的真实极性：高有效。
-     *
-     * 所以：空闲低（hi-Z 时由 MCU 上拉决定）-> 断言时器件拉高 -> 上升沿。
-     * 引脚配【上拉】，空闲有确定电平，上升沿有效。 */
+    /* 地磁 INT = PE1，上升沿（手册 P11 "Active High"）。
+     * 注意：中断功能未使能前该脚是 hi-Z，此时读到的电平只反映 MCU 侧配置，
+     * 不能用来判断器件极性。 */
     GPIO_EXTILineConfig(GPIO_PortSourceGPIOE, MMC_DRDY_PIN_SRC);
     e.EXTI_Line    = MMC_DRDY_EXTI_LINE;
     e.EXTI_Mode    = EXTI_Mode_Interrupt;
@@ -504,47 +425,21 @@ void BOARD_EXTI_Init(void)
 
 /*==============================================================================
  * EXTI 分组回调
- *
- *   ★ 分组归属（按 EXTI 线号，不是按引脚名）：
- *       EXTI_Line1  = PE1  -> EXTI7_0_IRQn   (IRQn=36)  <- 地磁 DRDY
- *       EXTI_Line11 = PD11 -> EXTI15_8_IRQn  (IRQn=33)  <- 陀螺 INT1
- *       EXTI_Line10 = PB10 -> EXTI15_8_IRQn  (IRQn=33)  <- 复位键
- *     EXTI 按【线号 0..7 / 8..15】分组，与引脚端口无关。
- *     PE1 是线 1，所以它走 EXTI7_0 —— 我先前误以为"PE1 在 EXTI15_8"，
- *     把处理体放进了错误的向量，而真正的 EXTI7_0 是个空函数、
- *     NVIC 也从没使能过。现象就是：器件 INT 已经恒高（断言中），
- *     中断计数却恒为 0。
+ * EXTI 按【线号 0..7 / 8..15】分组，与端口无关：
+ *     Line1  (PE1)  -> EXTI7_0_IRQn  (36)  地磁 DRDY
+ *     Line11 (PD11) -> EXTI15_8_IRQn (33)  陀螺 INT1
+ *     Line10 (PB10) -> EXTI15_8_IRQn (33)  复位键
  *============================================================================*/
 /*==============================================================================
- * 地磁 DRDY 中断 —— 中断内手动触发下一拍 + SET/RESET 极性处理
+ * 地磁 DRDY 中断 —— 读本拍数据，并在同一中断内准备并触发下一拍
  *
- * 【为什么把处理放进中断】
- *   完整一帧的耗时拆解（实测）：
- *     写 CTRL0 触发        ~10 us
- *     轮询等 Meas_M_Done   ~500 us   <- 长阻塞
- *     连读 7 字节          ~20 us
- *     写 STATUS 清锁存     ~10 us
- *   合计约 540 us，而地磁周期 1000 us。
- *   放在主循环里会受其它任务抖动影响，放中断里节拍最稳。
+ * 每拍耗时约 35us（读 7 字节 + 清锁存 + 极性处理 + 触发），
+ * 地磁周期 977us，放中断里节拍最稳。
+ * 抢占级必须低于陀螺：陀螺周期只有 130us，本 ISR 若优先会把陀螺推迟约
+ * 1/4 周期；反向无影响。优先级在 main.c 设（陀螺 0 / 地磁 1）。
  *
- * 【允许长阻塞，但陀螺必须能抢断】
- *   本 ISR 最长约 640 us（含 RESET 脉冲等待 100 us）。
- *   陀螺周期只有 130 us（7680 Hz），所以陀螺 DRDY 的抢占级必须
- *   【高于】地磁 —— 否则地磁一执行就把陀螺堵住 4 个周期，直接丢帧。
- *   反向影响可忽略：地磁周期 1000 us，被抢断几十 us 无所谓。
- *   优先级在 main.c 里设：陀螺 EXTI15_8 = 0，地磁 EXTI7_0 = 1。
- *
- * 【中断内两条纪律】
- *   1) 不碰浮点：RISC-V ISR 一旦使用 FP 寄存器就要额外保存/恢复，
- *      会把 80ns 的裸进出变成数百 ns。所以这里只搬原始 counts。
- *   2) 不 printf：那是约 300 us 的阻塞，且串口是共享资源。
- *      上报交主循环每秒做一次。
- *
- * 【极性与零偏】
- *   外界磁场会让 SET/RESET 两拍读数相反，两者求和即得器件零偏：
- *       offset = (SET 样本 + RESET 样本) / 2
- *   配对窗口越短、外界磁场相消越干净，所以用
- *   【本拍 RESET 样本 + 下一拍 SET 样本】跨周期配对（间隔约 623 us）。
+ * 纪律：不碰浮点（RISC-V ISR 用 FP 寄存器需额外保存/恢复）；
+ *       不 printf（几百 us 阻塞，串口也是共享资源）。上报交主循环。
  *============================================================================*/
 volatile int32_t  g_mmc_raw[3]      = {0, 0, 0};   /* X/Y/Z 原始 counts */
 volatile uint8_t  g_mmc_polarity    = 0u;          /* 本拍极性：0=SET 1=RESET */
@@ -552,19 +447,10 @@ volatile uint32_t g_mmc_isr_cnt     = 0u;          /* 中断进入次数 */
 volatile uint32_t g_mmc_spi_err     = 0u;          /* 中断内 SPI 失败次数 */
 volatile uint64_t g_mmc_drdy_ts     = 0u;          /* 本拍 DRDY 时刻（10ns）*/
 
-/*------------------------------------------------------------------------------
- * SET/RESET 配对累加（中断内完成）
- *
- * 【为什么在中断里配、而且用"上一拍"】
- *   极性每拍翻转，所以相邻两拍必然是一 SET 一 RESET ——
- *   用"上一拍样本 + 本拍样本"配，拿到的是【物理时间上最近的一对】。
- *   而按方向硬配（比如"RESET 配下一个 SET"）会人为拉长窗口：
- *   归档那种做法窗口约 623us，我先前那版固定 1280us。
- *   用最近的一对没有副作用：每拍都能构成一对，更新率不降。
- *
- * 【累加而不是覆盖】主循环每秒才取一次，如果各拍互相覆盖，
- *   只会剩下最后一对；累加 + 计数能给出这一秒内所有对的均值。
- *----------------------------------------------------------------------------*/
+/* SET/RESET 配对累加（中断内完成）。
+ * 极性每拍翻转，故相邻两拍必为一 SET 一 RESET —— 用"上一拍 + 本拍"配对，
+ * 即是物理时间上最近的一对，外界磁场相消最干净。
+ * 累加而非覆盖：主循环每秒才取一次，覆盖会丢掉这一秒内的其它对。 */
 volatile int64_t  g_mmc_pair_sum[3] = {0, 0, 0};   /* 每秒配对均值之累加 */
 volatile uint32_t g_mmc_pair_n      = 0u;          /* 本秒累计对数          */
 
@@ -578,7 +464,7 @@ volatile uint32_t g_mmc_pair_n      = 0u;          /* 本秒累计对数        
  *----------------------------------------------------------------------------*/
 volatile int16_t  g_imu_raw[6]  = {0, 0, 0, 0, 0, 0};
 volatile int16_t  g_imu_temp_raw = 0;
-volatile uint32_t g_imu_isr_cnt  = 0u;
+volatile uint32_t g_imu_isr_cnt  = 0u;   /* 陀螺 DRDY 次数 */
 volatile uint32_t g_imu_spi_err  = 0u;
 volatile uint64_t g_imu_drdy_ts  = 0u;   /* 本拍 DRDY 时刻（10ns）*/
 
@@ -591,27 +477,11 @@ static int32_t  s_pend_rst[3] = {0, 0, 0};
 static uint8_t  s_have_rst    = 0u;
 
 /*==============================================================================
- * 地磁 DRDY 中断 —— 严格照归档 mmc_cycle 的采样时序实现
+ * 地磁 DRDY 中断
  *
- * 【旧方法 mmc_cycle 的确切顺序（_newfunc.c 第 28-80 行）】
- *   1) for k in 0..b-1: MMC_ReadXYZ()        连续模式 + 自动 SET，读 b 个 SET 样本
- *   2) mmc_cfg_ex(0,0,0)                     切单次触发模式（关连续、关自动 SET）
- *   3) mmc_pulse(CTRL0_RESET)                发 RESET 脉冲（内部含 100us 等待）
- *   4) MMC_ConsumePending(0)                 ★ 消费在途转换（窗口 1400us，
- *                                            读到即丢弃；超时=本就没有在途）
- *   5) MMC_TriggerAndRead()                  触发并读【真正的 RESET 样本】
- *   6) mmc_auto_set_every()                  恢复自动 SET，进下一周期
- *   7) 配对：本周期 RESET + 下一周期首个 SET（间隔约 623us，最短）
- *
- * 【中断驱动的等价实现】
- *   SET 段   ：每拍 DRDY 中断读一个 SET 样本（连续模式 + 自动 SET）
- *   RESET 段 ：到达 SET 段末拍时，在同一个中断里
- *                切单次 -> 发 RESET -> ConsumePending 丢弃在途 -> 触发 RESET 拍
- *   RESET 拍 ：读出后暂存，恢复自动 SET，进下一周期
- *
- * 【中断内纪律】
- *   不碰浮点（FP 寄存器进出代价大）；不 printf（几百 us 阻塞）。
- *   上报交主循环每秒一次。
+ * SET 拍：读样本 -> 清锁存 -> 关连续/关自动SET -> 发 RESET 脉冲
+ *         -> 等 MMC_RST_PULSE_WAIT_US -> 触发 RESET 拍
+ * RESET 拍：读样本 -> 清锁存 -> 暂存供下周期配对 -> 恢复自动 SET 并触发 SET 拍
  *============================================================================*/
 void EXTI7_0_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
 void EXTI7_0_IRQHandler(void)
@@ -622,21 +492,26 @@ void EXTI7_0_IRQHandler(void)
 
         EXTI_ClearITPendingBit(MMC_DRDY_EXTI_LINE);
 
-        /* 记下本拍就绪时刻 —— 这是"数据就绪"的时间，不是"读完"的时间 */
         g_mmc_drdy_ts = GetTime64_10Ns();
         g_mmc_isr_cnt++;
 
-        /* --- 1) 读 X/Y/Z：7 字节，三轴共用第 7 字节 d[6] ---
-         *   X = d[0]<<10 | d[1]<<2 | d[6]>>6 & 0x03
-         *   Y = d[2]<<10 | d[3]<<2 | d[6]>>4 & 0x03
-         *   Z = d[4]<<10 | d[5]<<2 | d[6]>>2 & 0x03
-         * 注意三轴低 2 位都在 d[6] 里，第三个参数必须都传 d[6]。 */
+        /* 写共享区计数，供 V5F 上报地磁实际采样率 */
+        if (g_shm != 0)
+            g_shm->mmc_start_cnt = g_mmc_isr_cnt;
+
+        /* 读 7 字节：三轴低 2 位都在 d[6] 里，第三个参数必须都传 d[6] */
         if (SPI_ReadRegs(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN,
                          MMC5983MA_REG_XOUT0, d, 7u) == 0)
         {
             g_mmc_raw[0] = (int32_t)MMC5983MA_XYZ_X(d[0], d[1], d[6]);
             g_mmc_raw[1] = (int32_t)MMC5983MA_XYZ_Y(d[2], d[3], d[6]);
             g_mmc_raw[2] = (int32_t)MMC5983MA_XYZ_Z(d[4], d[5], d[6]);
+
+            /* 发布到共享区，供 V5F 在陀螺 DMA 中断里轮询取用。
+             * 屏障由 shm_chan_ts_write 内的 __sync_synchronize 提供。 */
+            if (g_shm != 0)
+                shm_publish_mmc(g_mmc_drdy_ts,
+                                g_mmc_raw[0], g_mmc_raw[1], g_mmc_raw[2]);
         }
         else
         {
@@ -644,21 +519,15 @@ void EXTI7_0_IRQHandler(void)
         }
         g_mmc_polarity = s_polarity;
 
-        /* --- 2) 清器件中断锁存（写 1 到 STATUS，两位一起清） ---
-         * 不清的话 INT 一直保持高，之后再也没有上升沿。 */
+        /* 清锁存（写 1 到 STATUS 两位）。不清则 INT 恒高，之后没有上升沿。 */
         (void)SPI_WriteReg(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN,
                            MMC5983MA_REG_STATUS,
                            (uint8_t)(MMC5983MA_ST_MEAS_M_DONE |
                                      MMC5983MA_ST_MEAS_T_DONE));
 
-        /* --- 3) 配对：本周期 RESET + 下一周期首个 SET ---
-         * 这正是归档的做法（_newfunc.c 第 42-44 行）：
-         *     px = (pend->x + s0x) / 2.0
-         * 其中 pend 是上一周期的 RESET 样本，s0 是本周期读到的第一个 SET。
-         * 两者时间上最接近（约 623us），外界磁场相消最新鲜。
-         *
-         * 判据不用时间戳：读到"本周期第一个 SET"时，若手上还留着上一周期的
-         * RESET 样本，就说明该配对了 —— 与固定周期数等价且不受抖动影响。 */
+        /* 配对：本周期 RESET + 下一周期首个 SET（时间上最接近，外界磁场相消最干净）。
+         * 判据即"上一拍是 SET 且手上还留着 RESET 样本"，不用时间戳。 */
+
         if (s_polarity == 0u && s_have_rst != 0u)
         {
             g_mmc_pair_sum[0] += ((int64_t)s_pend_rst[0] + (int64_t)g_mmc_raw[0]) / 2;
@@ -687,27 +556,14 @@ void EXTI7_0_IRQHandler(void)
                                MMC5983MA_REG_CTRL2,
                                (uint8_t)MMC5983MA_CM_FREQ_1000HZ);
 
-            /* 发 RESET 脉冲。
-             * 手册 P15：Reset 电流只走 500ns，且 Reset 位在操作结束时自清，
-             * 之后没有额外等待要求。这里按手册值加 4 倍余量取
-             * MMC_RST_PULSE_WAIT_US(2us)。
-             *
-             * 归档 mmc_pulse 用的是 100us —— 那是保守值，放在中断里会造成
-             * 100us 忙等，把陀螺（周期 130us）拖后，这里不采用。 */
+            /* RESET 脉冲；等待时间见 mmc5983.h 的 MMC_RST_PULSE_WAIT_US */
             (void)SPI_WriteReg(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN,
                                MMC5983MA_REG_CTRL0, MMC5983MA_CTRL0_RESET);
             HWT_DelayUs(MMC_RST_PULSE_WAIT_US);
 
-            /* 【不调用 MMC_ConsumePending】
-             * 归档是在主循环里顺序执行、靠轮询 Status 拿数据，所以需要
-             * "消费在途转换"把 RESET 之前那次转换读走丢弃。
-             * 本工程改成中断驱动后，数据由 DRDY 中断取 ——
-             * 每拍都对应一次完成的转换，不存在"读到旧转换"的问题，
-             * 这一步就没有必要。
-             * 实测它会白等一整个转换周期（MMC_CONV_PERIOD_US=826us）：
-             *   带它  -> 该分支间隔 2.12ms
-             *   不带  -> 应降到与另一分支相当（约 1ms 以内）
-             */
+            /* 不需要 MMC_ConsumePending：数据由 DRDY 中断取，
+             * 每拍都对应一次完成的转换，不存在读到旧转换的问题；
+             * 调用它反而会白等一整个转换周期（约 826us）。 */
 
             /* 触发并读真正的 RESET 样本：本中断返回后由 DRDY 拉起来 */
             (void)SPI_WriteReg(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN,
@@ -719,14 +575,13 @@ void EXTI7_0_IRQHandler(void)
         }
         else
         {
-            /* 本拍是 RESET。归档第 75-80 行：样本暂存，供下一周期首个 SET 配对，
-             * 然后 mmc_auto_set_every() 恢复自动 SET，进下一周期。 */
+            /* 本拍是 RESET：暂存供下一周期首个 SET 配对，然后恢复自动 SET */
             s_pend_rst[0] = g_mmc_raw[0];
             s_pend_rst[1] = g_mmc_raw[1];
             s_pend_rst[2] = g_mmc_raw[2];
             s_have_rst = 1u;
 
-            /* 恢复自动 SET + 触发下一拍 SET（归档 mmc_auto_set_every） */
+            /* 恢复自动 SET 并触发下一拍 SET */
             (void)SPI_WriteReg(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN,
                                MMC5983MA_REG_CTRL0,
                                (uint8_t)(MMC5983MA_CTRL0_TM_M |
@@ -740,30 +595,16 @@ void EXTI7_0_IRQHandler(void)
 
 /*==============================================================================
  * 9.8b PB10 复位键
- *
- *   按键特性：松开 = 外部弱上拉到 VCC，按下 = 强下拉到地。
- *   配成上拉输入 + EXTI10 下降沿，中断里整片软件复位。
- *
- *   启动保护：上电后 RST_GUARD_US 内忽略复位键。
- *   原因：按键可能在上电瞬间仍被按住（或松手抖动），若不屏蔽会形成
- *   "复位->按键仍按住->立即再复位"的高频连续复位循环，板子永远起不来。
- *   门限用 GetTime64_Us()（TIM9/TIM10 级联的 64 位安全计时，只读寄存器，
- *   ISR 里可用，不依赖任何中断）。
- *
- *   注意：EXTI15_8_IRQn = 33 (>31)，NVIC_SetAllocateIRQ 只对 >31 的有效，
- *         本中断正属于该区间，必须显式分配；否则默认归 V5F。
+ * 上拉输入 + EXTI10 下降沿，中断里整片软件复位。
+ * 上电后 RST_GUARD_US 内忽略按键：否则"复位->按键仍按住->立即再复位"
+ * 会形成高频复位循环，板子起不来。
+ * EXTI15_8_IRQn = 33 (>31)，必须显式 NVIC_SetAllocateIRQ，否则默认归 V5F。
  *============================================================================*/
 #define RST_GUARD_US   1000000ULL       /* 启动后 1 秒内禁止复位 */
 
 static volatile uint64_t s_rst_boot_us = 0;     /* 复位键初始化时刻 */
 
-/*------------------------------------------------------------------------------
- * 最小实验用：EXTI15_8 中断进入次数
- *
- * 中断里只做"清挂起位 + 计数"，主循环只打印这个计数。
- * 这是判断"EXTI 通路是否成立"的唯一依据 —— 不掺任何 DMA/时间戳/共享区逻辑。
- * 定义为全局非 static，供 main.c 用 extern 读取。
- *----------------------------------------------------------------------------*/
+/* EXTI15_8（陀螺 + 复位键）进入次数 */
 volatile uint32_t g_exti_irq_cnt = 0u;
 
 void BOARD_RSTKEY_Init(void)
@@ -790,87 +631,29 @@ void BOARD_RSTKEY_Init(void)
     /* 记下本时刻，作为启动保护窗口的基准 */
     s_rst_boot_us = GetTime64_Us();
 
-    /*--------------------------------------------------------------------------
-     * ★ 这里【不再】使能 EXTI15_8
-     *
-     * 本向量同时服务 PB10(复位键)、PE1(地磁 DRDY)、PD11(陀螺 DRDY)。
-     * 使能它的时机有两个互相冲突的要求：
-     *   复位键  —— 越早越好，否则 V3F 一旦卡住就只能断电重启
-     *   DRDY    —— 必须在"清掉 INT 锁存、引脚回低"之后，否则自动测量
-     *              已经在跑、引脚已经是高电平，EXTI 配的是上升沿，
-     *              就永远等不到 0→1 边沿（实测现象：PE1 恒高 + 中断计数 0）
-     *
-     * 顺序必须是：先清锁存让引脚回低，再使能 NVIC（见 main.c）。
-     * 复位键会晚几十毫秒可用，这是可接受的代价。
-     *------------------------------------------------------------------------*/
+    /* 此处不使能 EXTI15_8：两个 DRDY 都要求"先清 INT 锁存让引脚回低、
+     * 再开 NVIC"，否则锁存态下没有 0→1 边沿。NVIC 由 main.c 统一开。 */
 }
 
-/* EXTI15_8 分组中断服务 —— 本组合并了三条线：
- *   PB10  复位键（下降沿）
- *   PE1   地磁 DRDY（上升沿）
- *   PD11  陀螺 DRDY（上升沿）
- * 所以必须逐线判读并各自清挂起位。
- *
- * 【为什么把 DRDY 处理也放在这里而不是另开一个 ISR】
- * 一个分组只有一个向量，无法为同组的线分别注册处理函数；
- * 分成两个 ISR 会变成重复定义。处理体直接写在本函数内，
- * 本文件只做"判线 -> 转调"。
- *
- * ISR 用 WCH-Interrupt-fast 属性，与本文件的复位键 ISR 配套；
- * ch32h417_it.c 里只有系统异常向量。 */
+/* EXTI15_8 分组中断服务：一组合并两条线，必须逐线判读并各自清挂起位。
+ *   Line11 = PD11  陀螺 INT1（上升沿）
+ *   Line10 = PB10  复位键（下降沿）
+ * 一个分组只有一个向量，无法为同组的线分别注册处理函数。 */
 void EXTI15_8_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
 void EXTI15_8_IRQHandler(void)
 {
-    /*--------------------------------------------------------------------------
-     * 本分组服务两条线（都属线号 8..15）：
-     *   EXTI_Line11 = PD11 -> 陀螺 LSM6DSV16X INT1
-     *   EXTI_Line10 = PB10 -> 复位键
-     *
-     * ★ 地磁不在这里！地磁是 PE1 = EXTI_Line1，属 EXTI7_0 分组，
-     *   处理体在 EXTI7_0_IRQHandler。我先前把地磁也塞进本函数，
-     *   那个分支永远不会命中（本向量根本收不到线 1 的事件）。
-     *------------------------------------------------------------------------*/
 
-    /* --- 陀螺 DRDY (PD11) —— 本中断抢占级 0，高于地磁 ---
-     *
-     * 【为什么用 0x20 起 14 字节整块读】
-     *   LSM6DSV16X 输出块：0x20..0x2D = 温度2 + 陀螺6 + 加速度计6，
-     *   低字节在前、三轴连续。一次片选读完整块，
-     *   避免"读陀螺时被加速度计更新打断"导致的三轴不同步。
-     *   单次 SPI 事务（1 命令 + 14 数据）比拆成多次片选少约 4 次
-     *   CS 切换与 DMA suspend/resume，对 130us 的周期更友好。
-     *
-     * 【中断内纪律】
-     *   不碰浮点（ISR 用 FP 寄存器要额外保存/恢复）；不 printf。
-     *   只搬原始 16 位值，换算与上报由主循环做。 */
+    /* 陀螺 DRDY (PD11)：只启动 DMA，不搬数据。
+     * 拉低 CS + 启动 SPI2 TX DMA（命令 + dummy）后立即返回；
+     * 数据由 RX DMA 落进【大核自己的】缓冲，完成中断在大核侧解析并抬 CS。 */
     if (EXTI_GetITStatus(IMU_INT1_EXTI_LINE) != RESET)
     {
-        uint8_t d[LSM6DSV16X_BLOCK_LEN];
-
         EXTI_ClearITPendingBit(IMU_INT1_EXTI_LINE);
-
         g_imu_drdy_ts = GetTime64_10Ns();
         g_imu_isr_cnt++;
-
-        if (SPI_ReadRegs(IMU_SPI, IMU_CS_PORT, IMU_CS_PIN,
-                         LSM6DSV16X_REG_OUT_TEMP_L_BLK,
-                         d, (uint16_t)LSM6DSV16X_BLOCK_LEN) == 0)
-        {
-            /* 输出块字节序：d[0..1]=温度, d[2..7]=陀螺 XYZ, d[8..13]=加计 XYZ
-             * 每轴低字节在前，拼成 16 位补码。 */
-            g_imu_raw[0] = (int16_t)((uint16_t)d[2]  | ((uint16_t)d[3]  << 8));
-            g_imu_raw[1] = (int16_t)((uint16_t)d[4]  | ((uint16_t)d[5]  << 8));
-            g_imu_raw[2] = (int16_t)((uint16_t)d[6]  | ((uint16_t)d[7]  << 8));
-            g_imu_raw[3] = (int16_t)((uint16_t)d[8]  | ((uint16_t)d[9]  << 8));
-            g_imu_raw[4] = (int16_t)((uint16_t)d[10] | ((uint16_t)d[11] << 8));
-            g_imu_raw[5] = (int16_t)((uint16_t)d[12] | ((uint16_t)d[13] << 8));
-            g_imu_temp_raw = (int16_t)((uint16_t)d[0] | ((uint16_t)d[1] << 8));
-        }
-        else
-        {
-            g_imu_spi_err++;
-        }
-
+        if (g_shm != 0)
+            g_shm->imu_start_cnt = g_imu_isr_cnt;   /* 供 V5F 对比丢帧 */
+        BOARD_IMU_DrdyStart();                      /* 拉低 CS + 启动 TX DMA */
         g_exti_irq_cnt++;
     }
 
@@ -915,22 +698,182 @@ void BOARD_HMI_Init(void)
 }
 
 /*==============================================================================
+ * 9.12 陀螺 SPI2 的 TX 启动（DMA 采集的小核半边）
+ *
+ * 分工照 v2：小核只把时钟打出去，不碰 RX。
+ *   BOARD_IMU_DrdyStart()：填 TX 缓冲 -> 拉低 CS -> 启动 TX DMA -> 立即返回
+ *   RX 通道由大核配到它自己的缓冲，完成中断也在大核：
+ *     解析 -> 发布共享区 -> 抬 CS -> 重装 RX
+ *
+ * TX 缓冲是本核私有 static，不跨核共享。
+ *============================================================================*/
+#define IMU_DMA_TX_CH    DMA1_Channel5
+
+static uint8_t s_imu_tx[SENSOR_IMU_FRAME_LEN];
+
+void BOARD_IMU_DmaInit(void)
+{
+    DMA_InitTypeDef d = {0};
+    uint8_t i;
+
+    RCC_HBPeriphClockCmd(RCC_HBPeriph_DMA1, ENABLE);
+
+    s_imu_tx[0] = (uint8_t)(SENSOR_IMU_READ_CMD | 0x80u);
+    for (i = 1u; i < SENSOR_IMU_FRAME_LEN; i++) s_imu_tx[i] = 0xFFu;
+
+    DMA_DeInit(IMU_DMA_TX_CH);
+    d.DMA_PeripheralBaseAddr = (uint32_t)(&SPI2->DATAR);
+    d.DMA_Memory0BaseAddr    = (uint32_t)s_imu_tx;
+    d.DMA_DIR                = DMA_DIR_PeripheralDST;       /* 内存 -> 外设 */
+    d.DMA_BufferSize         = SENSOR_IMU_FRAME_LEN;
+    d.DMA_PeripheralInc      = DMA_PeripheralInc_Disable;
+    d.DMA_MemoryInc          = DMA_MemoryInc_Enable;
+    d.DMA_PeripheralDataSize = DMA_PeripheralDataSize_Byte;
+    d.DMA_MemoryDataSize     = DMA_MemoryDataSize_Byte;
+    d.DMA_Mode               = DMA_Mode_Normal;
+    d.DMA_Priority           = DMA_Priority_VeryHigh;
+    d.DMA_M2M                = DMA_M2M_Disable;
+    DMA_Init(IMU_DMA_TX_CH, &d);
+
+    /* Mux 必须 TX 与 RX 都绑 —— 用现成的组合函数，别只手绑 TX：
+     * 少了 RX 的绑定，RX 通道就收不到外设请求，DMA 永不完成，
+     * 大核的完成中断也就永不触发。 */
+    BOARD_SPI2_DMA_MuxInit();
+
+    /* 使能 SPI2 的 DMA 收发请求（RX 通道本体由大核配置，这里只管请求位开着） */
+    SPI_I2S_DMACmd(SPI2, SPI_I2S_DMAReq_Tx | SPI_I2S_DMAReq_Rx, ENABLE);
+}
+
+void BOARD_IMU_DrdyStart(void)
+{
+    IMU_CS_LOW();
+
+    /* CFGR 是 16 位寄存器，必须按 16 位操作，否则会把高 16 位误清零 */
+    IMU_DMA_TX_CH->CFGR &= (uint16_t)(~DMA_CFGR1_EN);
+    IMU_DMA_TX_CH->MADDR = (uint32_t)s_imu_tx;
+    IMU_DMA_TX_CH->CNTR  = SENSOR_IMU_FRAME_LEN;
+    IMU_DMA_TX_CH->CFGR |= DMA_CFGR1_EN;
+
+    /* 立即返回：不等传输完成。CS 抬起与数据解析都在大核的完成中断里做。 */
+}
+
+/*==============================================================================
+ * 9.13 陀螺 LSM6DSV16X 的初始化与使能
+ *
+ * 【为什么放在板级配置库而不是驱动里】
+ *   这两个函数不依赖任何全局量或静态量 —— 只用无状态的 SPI_ReadReg/WriteReg
+ *   （句柄由参数给）与 GetTime64 计时。所以【两个核都能直接调用】，
+ *   与总线对双核对称的性质一致，不需要任何跨核约定或条件编译。
+ *
+ *   消费方（大核）自己使能：它先把自己的 RX DMA 武装好，再调本函数启动陀螺，
+ *   这样第一帧 DRDY 一产生就能被读取，不会出现"数据就绪却无人读 ->
+ *   INT 锁存为高 -> 上升沿再也不来"的死局。
+ *============================================================================*/
+
+#define IMU_SPI_HANDLE()   IMU_SPI, IMU_CS_PORT, IMU_CS_PIN
+
+/* 配置陀螺；使能前仍处于掉电模式（ODR=0000，不产数据） */
+int BOARD_IMU_Init(void)
+{
+    uint8_t v = 0u;
+
+    /* 1) 软复位 */
+    if (SPI_WriteReg(IMU_SPI_HANDLE(), LSM6DSV16X_REG_CTRL3,
+                     LSM6DSV16X_CTRL3_SW_RESET) != 0)
+        return LSM6_ERR_SPI;
+    HWT_DelayUs(1000u);                 /* 手册未给复位时间，1ms 足够 */
+
+    /* 2) 校验 WHO_AM_I */
+    if (SPI_ReadReg(IMU_SPI_HANDLE(), LSM6DSV16X_REG_WHO_AM_I, &v) != 0)
+        return LSM6_ERR_SPI;
+    if (v != LSM6DSV16X_WHO_AM_I_VAL)
+        return LSM6_ERR_NO_ID;
+
+    /* 3) 接口配置：INT 高有效 + 推挽 + 4线SPI。该寄存器【不随软复位复位】
+     *    （手册 §9.3），必须显式写，不能依赖默认值。 */
+    if (SPI_WriteReg(IMU_SPI_HANDLE(), LSM6DSV16X_REG_IF_CFG,
+                     LSM6DSV16X_IFCFG_OUR_CFG) != 0)
+        return LSM6_ERR_SPI;
+
+    /* 4) BDU=1 + IF_INC=1。BDU 保证读低/高字节之间输出寄存器不更新，
+     *    对 7.68kHz 这种高速率尤其必要。 */
+    if (SPI_WriteReg(IMU_SPI_HANDLE(), LSM6DSV16X_REG_CTRL3,
+                     LSM6DSV16X_CFG_CTRL3_DEFAULT) != 0)
+        return LSM6_ERR_SPI;
+
+    /* 5) 陀螺满量程 ±4000dps（要求 OIS_G_EN=0，复位默认为 0） */
+    if (SPI_WriteReg(IMU_SPI_HANDLE(), LSM6DSV16X_REG_CTRL6,
+                     LSM6DSV16X_CFG_CTRL6_GYRO_4000) != 0)
+        return LSM6_ERR_SPI;
+
+    /* 6) 关闭数字 LPF1（手册未给该寄存器复位值，故显式写 0）。
+     *    关闭后仍有模拟抗混叠与 LPF2，群延迟最小（约 0.30ms），
+     *    代价是噪声升到约 81 mdps RMS。陀螺要积分，群延迟直接变姿态误差。 */
+    if (SPI_WriteReg(IMU_SPI_HANDLE(), LSM6DSV16X_REG_CTRL7,
+                     LSM6DSV16X_CTRL7_ALL_OFF) != 0)
+        return LSM6_ERR_SPI;
+
+    /* 7) DRDY_MASK=1：滤波器建立期间（约 1.86ms）不置 DRDY，
+     *    否则最初十几个样本全是无效的建立值。 */
+    if (SPI_WriteReg(IMU_SPI_HANDLE(), LSM6DSV16X_REG_CTRL4,
+                     LSM6DSV16X_CTRL4_DRDY_MASK) != 0)
+        return LSM6_ERR_SPI;
+
+    /* 8) 进入 HAODR（写 OP_MODE=001，此时 ODR 仍为 0000，满足手册 §6.5
+     *    "HAODR 必须在掉电模式下使能"的约束） */
+    if (SPI_WriteReg(IMU_SPI_HANDLE(), LSM6DSV16X_REG_CTRL1,
+                     LSM6DSV16X_XL_OPMODE_HAODR) != 0)
+        return LSM6_ERR_SPI;
+    if (SPI_WriteReg(IMU_SPI_HANDLE(), LSM6DSV16X_REG_CTRL2,
+                     LSM6DSV16X_G_OPMODE_HAODR) != 0)
+        return LSM6_ERR_SPI;
+
+    /* 9) 陀螺数据就绪路由到 INT1(PD11)：INT1_CTRL.INT1_DRDY_G = bit1 */
+    if (SPI_WriteReg(IMU_SPI_HANDLE(), LSM6DSV16X_REG_INT1_CTRL,
+                     LSM6DSV16X_INT1_DRDY_G) != 0)
+        return LSM6_ERR_SPI;
+
+    /* 10) HAODR 数据率表：00 -> 最高档 7680Hz */
+    if (SPI_WriteReg(IMU_SPI_HANDLE(), LSM6DSV16X_REG_HAODR_CFG,
+                     LSM6DSV16X_CFG_HAODR_SEL_00) != 0)
+        return LSM6_ERR_SPI;
+
+    /* 到这里器件已配好但仍处于掉电模式。启动转换必须由 BOARD_IMU_Enable()
+     * 在 EXTI 使能且消费方 RX 就绪之后单独做。 */
+    printf("LSM6,cfg_ok,odr=7680,fs_g=4000,dps_per_lsb=%.3f\r\n",
+           (double)LSM6_GYRO_DPS_PER_LSB);
+    return LSM6_OK;
+}
+
+/* 启动转换：把 ODR 写成非零，从掉电切到 HAODR 最高速。
+ * 必须在 DRDY 的 EXTI 使能【且】消费方的 RX 已就绪之后调用 ——
+ * 早使能会让 INT 在无人读取时锁存为高，之后没有上升沿。 */
+int BOARD_IMU_Enable(void)
+{
+    /* 加计与陀螺同步进 HAODR（手册 §6.5：两者必须一致） */
+    if (SPI_WriteReg(IMU_SPI_HANDLE(), LSM6DSV16X_REG_CTRL2,
+                     LSM6DSV16X_CFG_CTRL2_GYRO_HAODR_MAX) != 0)
+        return LSM6_ERR_SPI;
+
+    if (SPI_WriteReg(IMU_SPI_HANDLE(), LSM6DSV16X_REG_CTRL1,
+                     LSM6DSV16X_CFG_CTRL1_XL_HAODR_MAX) != 0)
+        return LSM6_ERR_SPI;
+
+    /* 建立等待 5ms：DRDY_MASK 只改变置起时机、不屏蔽建立过程，
+     * 加掩码后仍有单调收敛（幅度约 4dps，时间常数约 550us），取 4~5 个时间常数。 */
+    HWT_DelayUs(5000u);
+
+    printf("LSM6,enabled,odr=7680\r\n");
+    return LSM6_OK;
+}
+
+/*==============================================================================
  * 9.11 SPI DMA Mux 绑定
- *
- * 【两条 SPI 都必须用 DMA，所以不能共用通道】
- * 旧架构里 SPI1 与 SPI2 的 TX/RX 都落在 DMA1_Ch3/Ch2 上，只能二选一。
- * 新架构要求两条总线【同时】DMA 收发（地磁 DRDY 中断启动、陀螺 DRDY 中断启动），
- * 因此把 SPI2 挪到 DMA1_Ch4/Ch5，SPI1 保持原位。
- *
- * Mux 通道与 DMA 通道【一一对应】（DMA_MuxChannel1=0x00 -> DMA1_Ch1，依此类推），
- * 见 DMA_MuxChannelConfig() 的分组实现。请求号只取决于外设，与通道无关。
- *
- *   SPI1 (MMC5983MA)   TX = DMA1_Ch3 / Mux3 / REQ63
- *                      RX = DMA1_Ch2 / Mux2 / REQ64
- *   SPI2 (LSM6DSV16X)  TX = DMA1_Ch5 / Mux5 / REQ65
- *                      RX = DMA1_Ch4 / Mux4 / REQ66
- *
- * 请求号出处：EVT SPI_DMA 例程（SPI1_TX=63 SPI1_RX=64，SPI2_TX=65 SPI2_RX=66）。
+
+ * 两条 SPI 各占一组通道（Mux N 对应 DMA1_ChN，请求号只取决于外设）：
+ *   SPI1  TX=Ch3/Mux3/REQ63   RX=Ch2/Mux2/REQ64
+ *   SPI2  TX=Ch5/Mux5/REQ65   RX=Ch4/Mux4/REQ66
+ * 请求号出处：EVT SPI_DMA 例程。
  *============================================================================*/
 #define SPI1_DMA_TX_CH      DMA1_Channel3
 #define SPI1_DMA_TX_MUX     DMA_MuxChannel3

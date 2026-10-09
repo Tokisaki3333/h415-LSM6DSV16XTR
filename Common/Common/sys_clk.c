@@ -1,23 +1,23 @@
 #include "sys_clk.h"
 
-//Ê¹ÄÜTIM9¡¢10²¢¼¶Áª
+//ä½¿èƒ½TIM9ã€10å¹¶çº§è”
 void SYS_CLK_Init(void)
 {
     RCC_HB2PeriphClockCmd(RCC_HB2Periph_TIM9 | RCC_HB2Periph_TIM10, ENABLE);
 
     TIM9_12_TimeBaseInitTypeDef TimInit;
 
-    TimInit.TIM_Prescaler       = 0;       //·ÖÆµÖµ
+    TimInit.TIM_Prescaler       = 0;       //åˆ†é¢‘å€¼
     TimInit.TIM_CounterMode     = TIM_CounterMode_Up;
-    TimInit.TIM_Period          = 99999999;   //ÖØ×°Öµ
+    TimInit.TIM_Period          = 99999999;   //é‡è£…å€¼
     TimInit.TIM_ClockDivision   = TIM_CKD_DIV1;
 
     TIM9_12_TimeBaseInit(TIM9, &TimInit);
     TIM_ARRPreloadConfig(TIM9, ENABLE);
 
-    TimInit.TIM_Prescaler       = 0;       //·ÖÆµÖµ
+    TimInit.TIM_Prescaler       = 0;       //åˆ†é¢‘å€¼
     TimInit.TIM_CounterMode     = TIM_CounterMode_Up;
-    TimInit.TIM_Period          = 0xFFFFFFFF;   //ÖØ×°Öµ
+    TimInit.TIM_Period          = 0xFFFFFFFF;   //é‡è£…å€¼
     TimInit.TIM_ClockDivision   = TIM_CKD_DIV1;
 
     TIM9_12_TimeBaseInit(TIM10, &TimInit);
@@ -46,35 +46,35 @@ void HWT_DelayUs(uint64_t us)
 {
     uint64_t start = GetTime64_Us();
 
-    /* ¡ï ÓĞ½çµÈ´ı£º²»ÄÜÖ»ÒÀÀµ"¼ÆÊ±Æ÷Ò»¶¨Ç°½ø"¡£
+    /* â˜… æœ‰ç•Œç­‰å¾…ï¼šä¸èƒ½åªä¾èµ–"è®¡æ—¶å™¨ä¸€å®šå‰è¿›"ã€‚
      *
-     * Ô­Ğ´·¨ÊÇ `while ((GetTime64_Us() - start) < us);` ¡ª¡ª ÍË³öÌõ¼şÍêÈ«ÒÀÀµ
-     * TIM9/TIM10 ¼¶ÁªÔÚ×ß¡£Ò»µ©¼ÆÊ±Æ÷ÒòÈÎºÎÔ­Òò²»Ç°½ø£¨Ê±ÖÓ±»¹Ø¡¢¼¶ÁªÖĞ¶Ï
-     * ±»ÆÁ±Î¡¢ºËÏİÈëÒì³££©£¬Õâ¸öÑ­»·¾ÍÓÀÔ¶³ö²»À´£¬Õû¸öºË¾²Ä¬¡¢
-     * Á¬´®¿ÚºÍ¸´Î»¼ü¶¼Ê§Ğ§£¬Ö»ÄÜ¶Ïµç¡£
+     * åŸå†™æ³•æ˜¯ `while ((GetTime64_Us() - start) < us);` â€”â€” é€€å‡ºæ¡ä»¶å®Œå…¨ä¾èµ–
+     * TIM9/TIM10 çº§è”åœ¨èµ°ã€‚ä¸€æ—¦è®¡æ—¶å™¨å› ä»»ä½•åŸå› ä¸å‰è¿›ï¼ˆæ—¶é’Ÿè¢«å…³ã€çº§è”ä¸­æ–­
+     * è¢«å±è”½ã€æ ¸é™·å…¥å¼‚å¸¸ï¼‰ï¼Œè¿™ä¸ªå¾ªç¯å°±æ°¸è¿œå‡ºä¸æ¥ï¼Œæ•´ä¸ªæ ¸é™é»˜ã€
+     * è¿ä¸²å£å’Œå¤ä½é”®éƒ½å¤±æ•ˆï¼Œåªèƒ½æ–­ç”µã€‚
      *
-     * ¼ÓÒ»¸öÔ¶´óÓÚÕı³£ºÄÊ±µÄµü´úÉÏÏŞ×÷Îª¶µµ×£º
-     *   5ms @100MHz Ô¼ 50 Íò´ÎÑ­»·£¬1000 Íò´ÎÓàÁ¿Ô¼ 20 ±¶£¬Õı³£¾ø²»»á´¥·¢¡£
-     * ´¥·¢¼´ËµÃ÷¼ÆÊ±Æ÷Òì³£ ¡ª¡ª ´ËÊ±·µ»Ø±ÈËÀµÈÓĞÓÃµÃ¶à¡£ */
+     * åŠ ä¸€ä¸ªè¿œå¤§äºæ­£å¸¸è€—æ—¶çš„è¿­ä»£ä¸Šé™ä½œä¸ºå…œåº•ï¼š
+     *   5ms @100MHz çº¦ 50 ä¸‡æ¬¡å¾ªç¯ï¼Œ1000 ä¸‡æ¬¡ä½™é‡çº¦ 20 å€ï¼Œæ­£å¸¸ç»ä¸ä¼šè§¦å‘ã€‚
+     * è§¦å‘å³è¯´æ˜è®¡æ—¶å™¨å¼‚å¸¸ â€”â€” æ­¤æ—¶è¿”å›æ¯”æ­»ç­‰æœ‰ç”¨å¾—å¤šã€‚ */
     volatile uint32_t guard = 10000000u;
 
     while ((GetTime64_Us() - start) < us)
     {
         if (--guard == 0u)
-            return;                 /* ¼ÆÊ±Æ÷Î´Ç°½ø£º·ÅÆúµÈ´ı£¬ÈÃµ÷ÓÃ·½¼ÌĞø */
+            return;                 /* è®¡æ—¶å™¨æœªå‰è¿›ï¼šæ”¾å¼ƒç­‰å¾…ï¼Œè®©è°ƒç”¨æ–¹ç»§ç»­ */
     }
 }
 
 void HWT_DelayMs(uint64_t ms)
 {
-    HWT_DelayUs(ms * 1000ULL);   // ÎŞÒç³ö·çÏÕ
+    HWT_DelayUs(ms * 1000ULL);   // æ— æº¢å‡ºé£é™©
 }
 
 uint64_t GetTime64_10Ns(void)
 {
     uint32_t high1, high2, low;
     do {
-        high1 = TIM10->CNT_32;   /* high: æ•´ç§’ï¼ˆTIM10, ç”±æ¯ç§’ä¸€æ¬? update é©±åŠ¨ï¼? */
+        high1 = TIM10->CNT_32;   /* high: éå¯¸î—é”›åœ±IM10, é¢è¾¨ç˜¡ç»‰æç«´å¨†? update æ¤¹åå§©é”›? */
         low   = TIM9->CNT_32;    /* low: 10ns tick, 0..99999999, "+"1s=1e8 tick */
         high2 = TIM10->CNT_32;
     } while (high1 != high2);

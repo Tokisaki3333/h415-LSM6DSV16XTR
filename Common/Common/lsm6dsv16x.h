@@ -71,18 +71,14 @@ typedef struct
  * 接口
  *============================================================================*/
 
-/* 初始化：软复位 -> 校验 WHO_AM_I -> 关 LPF1 -> 开 DRDY_MASK
- * -> 掉电状态下进 HAODR -> 写 HAODR_CFG -> DRDY 路由到 INT1。
+/* LSM6_Init() / LSM6_Enable() 已移到 board_io.c 的 9.13 节（板级配置库）：
+ * 那两个函数不依赖任何全局/静态量（只用无状态的 SPI_ReadReg/WriteReg 与计时），
+ * 因此【两个核都能直接调用】，与总线对双核对称的性质一致。
  *
- * ★ 本函数【不启动转换】：器件保持掉电（ODR=0000），因此不产生 DRDY。
- *   启动转换必须用 LSM6_Enable()，且要在 DRDY 中断使能之后调用 ——
- *   否则第一个上升沿会丢，而锁存模式下丢了第一个边沿就再也没有第二个。
+ * 使用约定：由【消费方】自己使能 —— 大核先把 RX DMA 武装好、再调
+ * BOARD_IMU_Enable()，这样第一帧 DRDY 就能被读取，不会出现
+ * "数据就绪却无人读 -> INT 锁存为高 -> 上升沿再也不来"的死局。
  * 返回 LSM6_OK 或负错误码。 */
-int LSM6_Init(void);
-
-/* 启动第一次转换：写 ODR 从掉电切到 HAODR 最高速，并等滤波器建立（5ms）。
- * 【必须在两个 DRDY 中断使能之后调用】原因见上。 */
-int LSM6_Enable(void);
 
 /* 配置回读核对：读回 CTRL1/CTRL2/HAODR_CFG/CTRL6/CTRL7/IF_CFG 并打印比对。
  * 用于判断 SPI 写是否真的生效 —— INT 恒低时这是唯一能定论的检查。
@@ -136,3 +132,4 @@ int LSM6_TestBurst(uint32_t count);
 int LSM6_StressTest(uint32_t seconds);
 
 #endif /* __LSM6DSV16X_H */
+

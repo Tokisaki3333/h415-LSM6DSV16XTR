@@ -119,18 +119,6 @@
 				"post_script_description": "",
 				"excludeResources": [
 					"${project}/Startup/startup_ch32h417_v5f.S",
-					"${project}/Common/board.c",
-					"${project}/Common/board.h",
-					"${project}/Common/i2c_hw.c",
-					"${project}/Common/i2c_hw.h",
-					"${project}/User/ist8310.h",
-					"${project}/User/ist8310.c",
-					"${project}/Common/LVGL",
-					"${project}/Common/fonts12.h",
-					"${project}/Common/fonts_images.h",
-					"${project}/Common/ffunicode.c",
-					"${project}/Common/spi_hw.c",
-					"${project}/Common/spi_hw.h"
 				],
 				"optimization": {
 					"level": "fast",
@@ -219,8 +207,7 @@
 							"${project}/Core",
 							"${project}/User",
 							"${project}/Peripheral/inc",
-							"${project}/Common",
-							"${project}/Common/LVGL",
+							"${project}/Common"
 							"${project}/USBHS"
 						],
 						"include_system_paths": [],

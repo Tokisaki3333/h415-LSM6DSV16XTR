@@ -126,7 +126,6 @@
                   <listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/User}&quot;"/>
                   <listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/Peripheral/inc}&quot;"/>
                   <listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/Common}&quot;"/>
-                  <listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/Common/LVGL}&quot;"/>
                   <listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/USBHS}&quot;"/>
                 </option>
                 <option IS_BUILTIN_EMPTY="false" IS_VALUE_EMPTY="false" id="ilg.gnumcueclipse.managedbuild.cross.riscv.option.c.compiler.include.systempaths.2011720354" superClass="ilg.gnumcueclipse.managedbuild.cross.riscv.option.c.compiler.include.systempaths" useByScannerDiscovery="true" valueType="includePath"/>
@@ -271,7 +270,7 @@
             </toolChain>
           </folderInfo>
           <sourceEntries>
-            <entry excluding="Startup/startup_ch32h417_v5f.S|Common/board.c|Common/board.h|Common/i2c_hw.c|Common/i2c_hw.h|User/ist8310.h|User/ist8310.c|Common/LVGL|Common/fonts12.h|Common/fonts_images.h|Common/ffunicode.c|Common/spi_hw.c|Common/spi_hw.h|Common/sensor_dma.c|Common/sensor_dma.h|User/sensor_dma_rx.c" flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name=""/>
+            <entry excluding="Startup/startup_ch32h417_v5f.S|User/ist8310.h|User/ist8310.c|Common/sensor_dma_rx.c|Common/sdmmc_sd.c" flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name=""/>
           </sourceEntries>
         </configuration>
       </storageModule>

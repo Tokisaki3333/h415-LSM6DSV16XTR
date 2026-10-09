@@ -3,7 +3,7 @@
 
 #include "ch32h417.h"
 
-/* ÊıÑ§²¹³¥ÏµÊı£¬datasheet ¸½Â¼ 9.1 ¹Ì¶¨Öµ */
+/* æ•°å­¦è¡¥å¿ç³»æ•°ï¼Œdatasheet é™„å½• 9.1 å›ºå®šå€¼ */
 #define T1_scale         2.560000000000e+02f
 #define T2_scale_inv     9.313225746155e-10f
 #define T3_scale_inv     3.552713678801e-15f
@@ -24,25 +24,25 @@
 
 #define BMP388_P1_OFFSET 16384.0f   /* 2^14 */
 
-/* ±ê¶¨²ÎÊı£ºÃ¿¿ÅĞ¾Æ¬³ö³§Öµ²»Í¬£¬ÉÏµç´Ó 0x31~0x45 ¶ÁÈ¡ */
+/* æ ‡å®šå‚æ•°ï¼šæ¯é¢—èŠ¯ç‰‡å‡ºå‚å€¼ä¸åŒï¼Œä¸Šç”µä» 0x31~0x45 è¯»å– */
 int BMP388_ReadCalib(void);
 void BMP388_DumpCalib(void);
 
 /**
- * @brief ¶ÁÈ¡Ô­Ê¼ADC²¢×Ô¶¯Ö´ĞĞÈ«Ì×²¹³¥
- * @param dev7bit Æ÷¼ş7bit I2CµØÖ·
- * @param out_temp_c Êä³öÎÂ¶È£¨¡æ£©
- * @param out_press_pa Êä³öÆøÑ¹£¨Pa£©
- * @retval 0³É¹¦£¬-1Ğ¾Æ¬ID²»·û
+ * @brief è¯»å–åŸå§‹ADCå¹¶è‡ªåŠ¨æ‰§è¡Œå…¨å¥—è¡¥å¿
+ * @param dev7bit å™¨ä»¶7bit I2Cåœ°å€
+ * @param out_temp_c è¾“å‡ºæ¸©åº¦ï¼ˆâ„ƒï¼‰
+ * @param out_press_pa è¾“å‡ºæ°”å‹ï¼ˆPaï¼‰
+ * @retval 0æˆåŠŸï¼Œ-1èŠ¯ç‰‡IDä¸ç¬¦
  */
 int BMP388_ReadCompensated(uint8_t dev7bit, float *out_temp_c, float *out_press_pa);
 
 float bmp388_compensate_temp(uint32_t uncomp_temp);
 float bmp388_compensate_press(uint32_t uncomp_press, float t_lin);
-/* Ğ£Ñé CHIP_ID(0x00) ÊÇ·ñÎª 0x50£¬·µ»Ø 0 ÕıÈ· */
+/* æ ¡éªŒ CHIP_ID(0x00) æ˜¯å¦ä¸º 0x50ï¼Œè¿”å› 0 æ­£ç¡® */
 int BMP388_CheckID(uint8_t dev7bit);
 
-/* ¶Á 0x04~0x09 µÄÔ­Ê¼ 24bit Ñ¹Á¦/ÎÂ¶È */
+/* è¯» 0x04~0x09 çš„åŸå§‹ 24bit å‹åŠ›/æ¸©åº¦ */
 int BMP388_ReadRaw(uint8_t dev7bit,
                    uint32_t* out_uncomp_press,
                    uint32_t* out_uncomp_temp);

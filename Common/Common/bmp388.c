@@ -1,15 +1,15 @@
 #include "bmp388.h"
 #include "i2c_soft.h"
 
-/* ==================== ±ê¶¨²ÎÊı ====================
- * ¼Ä´æÆ÷ 0x31~0x45 ¹² 21 ×Ö½Ú£¬Î»Óò°´Êı¾İÊÖ²á Table 23 Æ´×°¡£
- * Ã¿¿ÅĞ¾Æ¬³ö³§±ê¶¨Öµ²»Í¬£¬±ØĞëÉÏµç¶ÁÈ¡¡£ */
+/* ==================== æ ‡å®šå‚æ•° ====================
+ * å¯„å­˜å™¨ 0x31~0x45 å…± 21 å­—èŠ‚ï¼Œä½åŸŸæŒ‰æ•°æ®æ‰‹å†Œ Table 23 æ‹¼è£…ã€‚
+ * æ¯é¢—èŠ¯ç‰‡å‡ºå‚æ ‡å®šå€¼ä¸åŒï¼Œå¿…é¡»ä¸Šç”µè¯»å–ã€‚ */
 static int16_t s_T1, s_T2;
 static int8_t  s_T3;
 static int16_t s_P1, s_P2, s_P5, s_P6, s_P9, s_P10, s_P11;
 static int8_t  s_P3, s_P4, s_P7, s_P8;
 
-/* ·µ»Ø 0 ³É¹¦ */
+/* è¿”å› 0 æˆåŠŸ */
 int BMP388_ReadCalib(void)
 {
     uint8_t d[21];
@@ -42,7 +42,7 @@ int BMP388_ReadCalib(void)
     return 0;
 }
 
-/* ´òÓ¡³ÉÒ»ĞĞ CSV£ºCAL,t1,t2,t3,p1..p11 */
+/* æ‰“å°æˆä¸€è¡Œ CSVï¼šCAL,t1,t2,t3,p1..p11 */
 void BMP388_DumpCalib(void)
 {
     printf("CAL,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
@@ -53,9 +53,9 @@ void BMP388_DumpCalib(void)
 }
 
 /**
- * @brief BMP388ÎÂ¶È²¹³¥
- * @param uncomp_temp 24bitÔ­Ê¼ADCÎÂ¶È
- * @return t_lin ÏßĞÔ»¯ÎÂ¶È(¡æ)
+ * @brief BMP388æ¸©åº¦è¡¥å¿
+ * @param uncomp_temp 24bitåŸå§‹ADCæ¸©åº¦
+ * @return t_lin çº¿æ€§åŒ–æ¸©åº¦(â„ƒ)
  */
 float bmp388_compensate_temp(uint32_t uncomp_temp)
 {
@@ -65,10 +65,10 @@ float bmp388_compensate_temp(uint32_t uncomp_temp)
 }
 
 /**
- * @brief BMP388Ñ¹Á¦²¹³¥
- * @param uncomp_press 24bitÔ­Ê¼ADCÑ¹Á¦
- * @param t_lin ÓÉbmp388_compensate_temp·µ»ØµÄÏßĞÔÎÂ¶È
- * @return ²¹³¥ºóÑ¹Á¦£¬µ¥Î» Pa
+ * @brief BMP388å‹åŠ›è¡¥å¿
+ * @param uncomp_press 24bitåŸå§‹ADCå‹åŠ›
+ * @param t_lin ç”±bmp388_compensate_tempè¿”å›çš„çº¿æ€§æ¸©åº¦
+ * @return è¡¥å¿åå‹åŠ›ï¼Œå•ä½ Pa
  */
 float bmp388_compensate_press(uint32_t uncomp_press, float t_lin)
 {
@@ -97,7 +97,7 @@ float bmp388_compensate_press(uint32_t uncomp_press, float t_lin)
     return po1 + po2 + pdB4;
 }
 
-/* ÉÏµçĞ£ÑéÒ»´ÎĞ¾Æ¬ ID ¼´¿É£¬²»±ØÃ¿Ö¡ÖØ¶Á£¨Ã¿Ö¡ÖØ¶ÁÒª¶à»¨Ò»´Î I2C ÊÂÎñ£© */
+/* ä¸Šç”µæ ¡éªŒä¸€æ¬¡èŠ¯ç‰‡ ID å³å¯ï¼Œä¸å¿…æ¯å¸§é‡è¯»ï¼ˆæ¯å¸§é‡è¯»è¦å¤šèŠ±ä¸€æ¬¡ I2C äº‹åŠ¡ï¼‰ */
 int BMP388_CheckID(uint8_t dev7bit)
 {
     return (I2C_ReadReg(dev7bit, 0x00) == 0x50) ? 0 : -1;
@@ -107,7 +107,7 @@ int BMP388_ReadRaw(uint8_t dev7bit,
                             uint32_t* out_uncomp_press,
                             uint32_t* out_uncomp_temp)
 {
-    uint8_t d[6];   /* 0x04~0x09£ºÑ¹Á¦+ÎÂ¶È¸÷ 3 ×Ö½Ú£¬µÍ×Ö½ÚÔÚÇ° */
+    uint8_t d[6];   /* 0x04~0x09ï¼šå‹åŠ›+æ¸©åº¦å„ 3 å­—èŠ‚ï¼Œä½å­—èŠ‚åœ¨å‰ */
 
     if (I2C_ReadMulti(dev7bit, 0x04, d, 6) != 0)
     {

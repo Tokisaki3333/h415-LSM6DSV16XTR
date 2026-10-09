@@ -43,17 +43,20 @@ extern "C" {
 #ifndef BOARD_EN_SPI2_IMU
 #define BOARD_EN_SPI2_IMU       1       /* IMU SPI2 */
 #endif
+/* 下面这些模块的实现已归档到 _archive/legacy_disabled_features/，
+ * 默认必须为 0 —— 否则 board_io.c 里被 #if 门控的初始化会引用不存在的符号。
+ * 若要恢复某模块，把文件移回本目录并置 1。 */
 #ifndef BOARD_EN_I2C_BMP388
 #define BOARD_EN_I2C_BMP388     1       /* 气压计软件 I2C (PF0/PF1) */
 #endif
 #ifndef BOARD_EN_USART2_GNSS
-#define BOARD_EN_USART2_GNSS    1       /* GNSS 串口 */
+#define BOARD_EN_USART2_GNSS    0       /* GNSS 串口（驱动已归档） */
 #endif
 #ifndef BOARD_EN_CAN1
-#define BOARD_EN_CAN1           0       /* CAN1（默认关闭，需要时置 1） */
+#define BOARD_EN_CAN1           0       /* CAN1（未实现） */
 #endif
 #ifndef BOARD_EN_SDMMC
-#define BOARD_EN_SDMMC          0       /* SD 卡（默认关闭，需要时置 1） */
+#define BOARD_EN_SDMMC          0       /* SD 卡（驱动已归档） */
 #endif
 #ifndef BOARD_EN_EXTI
 #define BOARD_EN_EXTI           1       /* 磁强计/IMU 中断引脚 + EXTI */
@@ -306,18 +309,20 @@ extern volatile uint64_t g_imu_drdy_ts;
 void BOARD_SPI1_DMA_MuxInit(void);
 void BOARD_SPI2_DMA_MuxInit(void);
 
+/* 陀螺 SPI2 的 TX 侧（DMA 采集的小核半边，见 board_io.c 9.12） */
+void BOARD_IMU_DmaInit(void);
+void BOARD_IMU_DrdyStart(void);
+int  BOARD_IMU_Init(void);        /* 配置陀螺（不启动转换）*/
+int  BOARD_IMU_Enable(void);      /* 启动陀螺转换（须在 EXTI 与消费方 RX 就绪后）*/
+
 /* 软件 I2C 位操作（供 BMP388 驱动使用）
  * 板上 PF0/PF1 有外部上拉，因此：
- *   - 输出时用开漏（写 0 拉低 / 写 1 释放），高电平由外布拉起
- *   - 读 ACK/数据时把 SDA 切成输入（SDA_TO_RX），读完切回输出（SDA_TO_TX）
- */
+ *   - 输出时用开漏（写 0 拉低 / 写 1 释放），高电平由【外部上拉】抬起
+ *     （PF0/PF1 的 R34/R36，见网表） */
 void    BMP_I2C_SCL_HIGH(void);         /* 释放 SCL（开漏输出） */
 void    BMP_I2C_SCL_LOW(void);          /* 拉低 SCL */
 void    BMP_I2C_SDA_HIGH(void);         /* 释放 SDA（开漏输出） */
 void    BMP_I2C_SDA_LOW(void);          /* 拉低 SDA */
-void    BMP_I2C_BUS_IDLE(void);         /* 两线都切上拉输入 = 释放 + 上拉 */
-void    BMP_I2C_SDA_TO_RX(void);        /* SDA 切上拉输入，准备读 ACK/数据 */
-void    BMP_I2C_SDA_TO_TX(void);        /* SDA 切回开漏输出 */
 uint8_t BMP_I2C_SDA_READ(void);
 uint8_t BMP_I2C_SCL_READ(void);
 void    BMP_I2C_Delay(void);

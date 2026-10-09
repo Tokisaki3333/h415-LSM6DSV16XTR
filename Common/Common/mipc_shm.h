@@ -69,7 +69,9 @@ typedef struct {
     chan_hdr_t hdr;                     /* 12 B */
     volatile float temp_celsius;        /* ℃ */
     volatile float press_pascal;        /* Pa */
-} bmp_chan_t;                           /* 20 B */
+    volatile uint32_t wait_us;          /* 进入 DRDY 轮询后等了多久（us）
+                                         * 0/1 说明轮询开始得太晚，时序有误 */
+} bmp_chan_t;                           /* 24 B */
 
 /* ---- GPS RMC：定位 / 速度 / 航向 / 磁偏角 / 日期 ----
  * 三态判读：无 SHM_RMC_STATUS → 未启动/无语句；status=='V' → 有信号无定位；'A' → 定位有效。 */
@@ -141,6 +143,14 @@ typedef struct {
 typedef struct {
     volatile uint32_t v5f_progress;     /* V5F 握手进度 1..6 */
     volatile uint32_t v3f_cfg_done;     /* IMU 配置完成信号 */
+    volatile uint32_t imu_start_cnt;    /* 陀螺 DRDY 次数（V3F 写、V5F 读）。
+                                         * 与 imu.hdr.cnt（V5F 解析后发布）对比即知丢帧：
+                                         * start_cnt - cnt = 未走完 DMA 的帧数。 */
+    volatile uint32_t v5f_dma_ready;    /* V5F 的 RX DMA 通道已配好、可以接收陀螺数据。
+                                         * V3F 必须等它置 1 才启动采集 —— 否则首帧 DMA
+                                         * 落空，陀螺 INT 锁存后就再无上升沿。 */
+    volatile uint32_t mmc_start_cnt;    /* 地磁 DRDY 次数（V3F 写、V5F 读）。
+                                         * 地磁不走 DMA，这个计数就是它的实际采样率。 */
     log_chan_t        log;
     imu_chan_t        imu;              /* LSM6DSV16X 六轴 + 温度 */
     mmc_chan_t        mmc;              /* MMC5983MA 三轴 18 位原始值 */
@@ -189,10 +199,12 @@ static inline void shm_publish_mmc(uint64_t ts_drdy, int32_t mx, int32_t my, int
 }
 
 /* BMP388：温度/气压直接以 float 传递（无定点往返） */
-static inline void shm_publish_bmp(uint64_t ts_drdy, float temp_celsius, float press_pascal)
+static inline void shm_publish_bmp(uint64_t ts_drdy, float temp_celsius,
+                                    float press_pascal, uint32_t wait_us)
 {
     g_shm->bmp.temp_celsius = temp_celsius;
     g_shm->bmp.press_pascal = press_pascal;
+    g_shm->bmp.wait_us = wait_us;
     shm_chan_ts_write(&g_shm->bmp.hdr, ts_drdy);
     g_shm->bmp.hdr.cnt++;
 }
