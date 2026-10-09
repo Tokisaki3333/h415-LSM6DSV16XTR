@@ -47,7 +47,7 @@ static void cs_high(GPIO_TypeDef *port, uint16_t pin)
 /*==============================================================================
  * CPU 阻塞式访问时的 DMA 冲突处理
  *
- * 【问题】SPI 的 RX DMA 请求一旦打开（SENSOR_DMA_Init 里做的），DMA 会与 CPU
+ * 【问题】SPI 的 RX DMA 请求一旦打开（DMA 路径初始化时做的），DMA 会与 CPU
  * 争抢同一个 DATAR 寄存器：
  *   发一个字节 -> 器件回一个字节进 DATAR -> RXNE 置位，同时 DMA 请求有效
  *   -> DMA 硬件【立刻】把 DATAR 读走 -> RXNE 被清

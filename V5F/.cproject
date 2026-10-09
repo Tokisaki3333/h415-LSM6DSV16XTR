@@ -272,7 +272,7 @@
             </toolChain>
           </folderInfo>
           <sourceEntries>
-            <entry excluding="Startup/startup_ch32h417_v3f.S|Common/board.c|Common/board.h|Common/LVGL" flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name=""/>
+            <entry excluding="Startup/startup_ch32h417_v3f.S|Common/board.c|Common/board.h|Common/LVGL|Common/sensor_dma.c|Common/sensor_dma.h|User/src/sensor_dma_rx.c" flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name=""/>
           </sourceEntries>
         </configuration>
       </storageModule>

@@ -9,8 +9,8 @@
  * （proc_* 系列），以后做运动解析时可作参考。
  *
  * 新实现：
- *   小核 V3F  Common/Common/sensor_dma.c
- *   大核 V5F  V5F/User/src/sensor_dma_rx.c
- *   共享约定  Common/Common/sensor_dma.h
+ *   小核 V3F  Common/Common/board_io.c 的两个 DRDY 中断
+ *   大核 V5F  待接入
+ *   共享约定  待建（原 DMA 路径已归档到 _archive/deadcode_dma_path/）
  */
 //GPS-pps PE1

@@ -498,8 +498,8 @@ void BOARD_EXTI_Init(void)
     e.EXTI_LineCmd = ENABLE;
     EXTI_Init(&e);
 
-    /* NVIC 分配与优先级由应用层（SENSOR_DMA_Init）做 ——
-     * 两个 DRDY 都归小核 V3F，且地磁抢占级高于陀螺。 */
+    /* NVIC 分配与优先级由应用层（main.c）做：
+     * 两个 DRDY 都归小核 V3F，陀螺抢占级 0、地磁 1。 */
 }
 
 /*==============================================================================
@@ -550,8 +550,7 @@ volatile int32_t  g_mmc_raw[3]      = {0, 0, 0};   /* X/Y/Z 原始 counts */
 volatile uint8_t  g_mmc_polarity    = 0u;          /* 本拍极性：0=SET 1=RESET */
 volatile uint32_t g_mmc_isr_cnt     = 0u;          /* 中断进入次数 */
 volatile uint32_t g_mmc_spi_err     = 0u;          /* 中断内 SPI 失败次数 */
-/* 本拍 DRDY 时刻（10ns）由 sensor_dma.c 定义、board_io.h 声明 ——
- * 不要在此重复定义，否则链接期 multiple definition。 */
+volatile uint64_t g_mmc_drdy_ts     = 0u;          /* 本拍 DRDY 时刻（10ns）*/
 
 /*------------------------------------------------------------------------------
  * SET/RESET 配对累加（中断内完成）
@@ -581,8 +580,7 @@ volatile int16_t  g_imu_raw[6]  = {0, 0, 0, 0, 0, 0};
 volatile int16_t  g_imu_temp_raw = 0;
 volatile uint32_t g_imu_isr_cnt  = 0u;
 volatile uint32_t g_imu_spi_err  = 0u;
-/* g_imu_drdy_ts 由 sensor_dma.c 定义、board_io.h 声明 ——
- * 不在此重复定义，否则链接期 multiple definition。 */
+volatile uint64_t g_imu_drdy_ts  = 0u;   /* 本拍 DRDY 时刻（10ns）*/
 
 /* 当前拍的极性：0 = SET（连续 + 自动 SET），1 = RESET（单次触发） */
 static volatile uint8_t s_polarity = 0u;
@@ -802,7 +800,7 @@ void BOARD_RSTKEY_Init(void)
      *              已经在跑、引脚已经是高电平，EXTI 配的是上升沿，
      *              就永远等不到 0→1 边沿（实测现象：PE1 恒高 + 中断计数 0）
      *
-     * 现在统一交给 SENSOR_DMA_ArmDrdy()：调用方先清锁存、再调它。
+     * 顺序必须是：先清锁存让引脚回低，再使能 NVIC（见 main.c）。
      * 复位键会晚几十毫秒可用，这是可接受的代价。
      *------------------------------------------------------------------------*/
 }
@@ -815,7 +813,7 @@ void BOARD_RSTKEY_Init(void)
  *
  * 【为什么把 DRDY 处理也放在这里而不是另开一个 ISR】
  * 一个分组只有一个向量，无法为同组的线分别注册处理函数；
- * 分成两个 ISR 会变成重复定义。处理体本身在 sensor_dma.c，
+ * 分成两个 ISR 会变成重复定义。处理体直接写在本函数内，
  * 本文件只做"判线 -> 转调"。
  *
  * ISR 用 WCH-Interrupt-fast 属性，与本文件的复位键 ISR 配套；

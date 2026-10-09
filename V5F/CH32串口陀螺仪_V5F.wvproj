@@ -117,7 +117,6 @@
 					"${project}/Common/board.c",
 					"${project}/Common/board.h",
 					"${project}/Common/LVGL",
-					"${project}/Common/sensor_dma.c",
 					"${project}/Common/spi_hw.c",
 					"${project}/Common/spi_hw.h",
 					"${project}/User/src/SPI_rx.c"

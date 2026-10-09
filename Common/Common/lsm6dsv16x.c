@@ -124,7 +124,7 @@ int LSM6_Init(void)
      *
      * ★ 为什么不在 Init 里顺手把 ODR 写下去
      *   若这里就使能，陀螺立刻开始产数据 -> PD11 的第一个上升沿在
-     *   SENSOR_DMA_Init() 装 DMA / 使能 EXTI 之前就到达 -> 边沿丢失。
+     *   NVIC_EnableIRQ(EXTI15_8) 使能 EXTI 之前就到达 -> 边沿丢失。
      *   而 DRDY 是【锁存】模式，INT 会一直保持高，之后没有新的上升沿
      *   -> 永远不进中断，DMA 也永远不启动 -> 死锁。
      *   所以"启动第一次转换"必须由 LSM6_Enable() 在中断 armed 之后单独做。
