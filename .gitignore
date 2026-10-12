@@ -37,8 +37,14 @@ obj/
 /*/sources.mk
 
 # ------------------------- MounRiver Studio 工作区状态 -------------------------
-# MRS 工作区状态目录（.mrs/*.mrs-workspace，内含本机绝对路径）
+# MRS 工作区状态目录整体忽略；其中【非临时】的工程文件再单独强制入库：
+#   .mrs/CH32串口陀螺仪.mrs-workspace      工作区定义（folders 为相对路径，指向 V3F/V5F）
+#   V3F/.mrs/preferredEncoding.json        工程级文件编码配置
 .mrs/
+!.mrs/CH32串口陀螺仪.mrs-workspace
+!V3F/.mrs/preferredEncoding.json
+# 编辑器布局快照：纯临时状态（partsEditor / textFileEditor / labeledBookmarks，含本机绝对路径）
+.mrs/*.snapshot
 *.wvproj.bak
 *.wvproj.user
 *.launch.bak
