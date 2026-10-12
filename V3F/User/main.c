@@ -43,6 +43,131 @@
 #include "mipc_shm.h"        /* g_shm + 通道结构 */
 #include "ch32h417.h"
 
+/*==============================================================================
+ * 地磁失效恢复
+ *
+ * 失效机理（已在多份录制上复现，g_mmc_isr_cnt 冻结在 10378 / 418844 且此后永不更新）：
+ *   ISR 末尾那次"写 STATUS 清输出锁存"若没生效，INT 保持高（高有效 + 电平锁存），
+ *   而 EXTI 是上升沿触发 ⟹ 之后【再无上升沿】⟹ ISR 永不进入
+ *   ⟹ g_mmc_isr_cnt 冻结，三轴与 pol 一起冻结（它们与计数在同一个 ISR 里发布）
+ *   ⟹ 软件侧唯一的清除点在 ISR 内，而 ISR 已经不跑 ⟹ 只能整板断电
+ *
+ * 本恢复路径补上 ISR 之外的入口：
+ *   第 1 级（几十 us）: 主动写一次器件 STATUS(0x08) 清输出锁存，2ms 内看计数是否恢复
+ *   第 2 级（~12 ms）: 仍未恢复则写【器件 CTRL1 的 SW_RST 位】让地磁自身复位，
+ *                      再重跑 MMC_Init/ClearLatch/Enable
+ *
+ * ★ 两级都只操作 MMC5983MA 自己的寄存器 —— MCU 不复位、不外设复位、不重入 main()。
+ *   连续录制因此不会中断，只是地磁在这段时间不产生样本。
+ *
+ * 检测判据用 g_mmc_isr_cnt：它写在 ISR 最开头，早于任何 SPI 操作，
+ * 所以"计数不动"等价于"ISR 没进"，不受 ISR 内 SPI 失败干扰。
+ * 地磁周期约 977us，"停滞 2ms"已错过两拍，不会误触发。
+ *
+ * 调用位置：气压计 23.5ms 转换窗口内的 GPS 轮询里 —— 那里不阻塞气压计时序，
+ * 且单次开销（几次 SPI 读 ~几 us）远小于 GPS 分块（150 字节约 68us）。
+ *============================================================================*/
+#define MMC_STALL_US            2000u   /* 连续这么久计数不动 = 停滞 */
+#define MMC_RECOVER_WAIT_US     2000u   /* 清锁存后等这么久看是否恢复 */
+
+static uint32_t s_mmc_last_cnt    = 0u;      /* 上次见到的 DRDY 计数 */
+static uint64_t s_mmc_last_chg_us = 0u;      /* 计数上次变化的时刻 */
+static uint8_t  s_mmc_in_recover  = 0u;      /* 防重入 */
+
+/* 恢复计数只在本核累加，随后写进共享区供 V5F 上报（V5F 看不到本核的全局符号，
+ * 做成跨核 extern 会链接失败 —— 所以走共享区，见 mipc_shm.h 的同名字段）。 */
+static uint32_t s_mmc_recover_cnt    = 0u;   /* 第 1 级(清锁存)触发次数 */
+static uint32_t s_mmc_reinit_cnt     = 0u;   /* 第 2 级(软件复位)触发次数 */
+static uint32_t s_mmc_last_reinit_rc = 0u;   /* 最近一次 MMC_Init 返回码 */
+
+static void MMC_RecoverPublish(void)
+{
+    if (g_shm == 0)
+        return;
+    g_shm->mmc_recover_cnt    = s_mmc_recover_cnt;
+    g_shm->mmc_reinit_cnt     = s_mmc_reinit_cnt;
+    g_shm->mmc_last_reinit_rc = s_mmc_last_reinit_rc;
+}
+
+static void MMC_RecoverPoll(void)
+{
+    uint64_t now;
+    uint32_t cnt;
+
+    if (s_mmc_in_recover != 0u)
+        return;
+
+    cnt = g_mmc_isr_cnt;
+    now = GetTime64_Us();
+
+    /* 计数前进：刷新时间戳 */
+    if (cnt != s_mmc_last_cnt)
+    {
+        s_mmc_last_cnt    = cnt;
+        s_mmc_last_chg_us = now;
+        return;
+    }
+
+    /* 计数不动，且还没到停滞门限 */
+    if ((now - s_mmc_last_chg_us) < (uint64_t)MMC_STALL_US)
+        return;
+
+    /*--- 判定停滞，开始恢复（此时 now 即停滞判定时刻） ---*/
+    s_mmc_in_recover = 1u;
+    s_mmc_recover_cnt++;
+    MMC_RecoverPublish();
+
+    /* 第 1 级：主动清一次输出锁存（不依赖 ISR） */
+    (void)MMC_ClearLatch();
+
+    {
+        uint64_t t_end = now + (uint64_t)MMC_RECOVER_WAIT_US;
+        do
+        {
+            if (g_mmc_isr_cnt != s_mmc_last_cnt)
+            {
+                /* 恢复了：锁存已清，下一次测量完成会产生真正的上升沿 */
+                s_mmc_last_cnt    = g_mmc_isr_cnt;
+                s_mmc_last_chg_us = GetTime64_Us();
+                s_mmc_in_recover  = 0u;
+                return;
+            }
+        } while ((int64_t)(t_end - GetTime64_Us()) > 0);
+    }
+
+    /* 第 2 级：清锁存无效 ⟹ 器件测量状态机也需复位。
+     * 只写【器件 CTRL1 的 SW_RST 位】让地磁自身复位（MCU 不动），
+     * 再重跑初始化。MMC_Init 内部即为"写 SW_RST → 等 OTP → 清标志 → 配寄存器"。 */
+    s_mmc_reinit_cnt++;
+    {
+        int rc = MMC_Init();
+        s_mmc_last_reinit_rc = (uint32_t)(rc & 0xFF);
+
+        if (rc == MMC_OK)
+        {
+            (void)MMC_ClearLatch();     /* 必须在开测量前清，否则第一个上升沿会丢 */
+            rc = MMC_Enable();
+            if (rc != MMC_OK)
+                s_mmc_last_reinit_rc = 0x80u | (uint32_t)(rc & 0x7Fu);
+        }
+    }
+    MMC_RecoverPublish();
+
+    s_mmc_last_cnt    = g_mmc_isr_cnt;
+    s_mmc_last_chg_us = GetTime64_Us();
+    s_mmc_in_recover  = 0u;
+}
+
+/* 主循环开始前调用一次：把"计数上次变化时刻"对齐到当前时刻。
+ * 不这样做的话 s_mmc_last_chg_us 还是 0，主循环第一轮就会 now-0 >= 2ms
+ * 而误判为停滞（虽然第 1 级清锁存是幂等无害的，但会白记一次 recover_cnt）。 */
+static void MMC_RecoverArm(void)
+{
+    s_mmc_last_cnt    = g_mmc_isr_cnt;
+    s_mmc_last_chg_us = GetTime64_Us();
+    s_mmc_in_recover  = 0u;
+}
+
 int main(void)
 {
     int rc;
@@ -128,6 +253,9 @@ int main(void)
     rc = MMC_Enable();
     printf("MMC,enable_rc=%d\r\n", rc);
 
+    /* 5. 武装地磁恢复看门狗（对齐"计数上次变化时刻"，避免首轮误判） */
+    MMC_RecoverArm();
+
     /* 气压计：显式初始化软件 I2C 引脚（基线就是这么调的），再配置器件 */
     SOFT_I2C_GPIO_Init();
     BMP388_Init();
@@ -157,9 +285,13 @@ int main(void)
         BMP388_TriggerMeasurement();
         t_trig = GetTime64_Us();
 
-        /* 转换期：有 GPS 数据就处理一块（限 150 字节 ~ 68us），否则原地重试 */
+        /* 转换期：有 GPS 数据就处理一块（限 150 字节 ~ 68us），否则原地重试。
+         * 同时在这里跑地磁失效恢复：本窗口约 21ms 余量，恢复的第 1 级只需几十 us，
+         * 第 2 级（软件复位）最多占 10~30ms —— 会吃掉本窗口的余量，
+         * 但"地磁整段报废"比"气压计晚一拍"严重得多，所以允许。 */
         while ((int64_t)((t_trig + BARO_CONV_US - BARO_DRDY_GUARD_US) - GetTime64_Us()) > 0)
         {
+            MMC_RecoverPoll();     /* 地磁失效恢复：先清锁存，2ms 不恢复则软复位 */
             if (GPS_Check(GPS_CHUNK_BYTES) == 0u)
                 continue;              /* 没新数据，继续等转换，不要退出 */
         }

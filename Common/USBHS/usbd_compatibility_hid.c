@@ -31,6 +31,11 @@ volatile uint16_t hid_RdPtr = 0;                                        /* 待�
 volatile uint16_t hid_WrPtr = 0;                                        /* 生产者已写入游标(输入),头指针 */
 volatile uint16_t hid_BytesAvail = 0;                                   /* 待上传字节数(= 头-尾),消费者扣减 */
 
+volatile uint32_t g_ep_busy  = 0;   /* 端点非 NAK 导致装包失败次数 */
+volatile uint32_t g_ep_empty = 0;   /* 环内无字节次数 */
+volatile uint32_t g_ep_sent  = 0;   /* 实际装包成功次数 */
+volatile uint32_t g_ep_bytes = 0;   /* 累计装出字节数 */
+
 volatile uint16_t Data_Pack_Max_Len = 0;                                /* 单个 HID 报告可载净字节(按速度) */
 volatile uint16_t Head_Pack_Len = 0;                                    /* HID 报告头部长度(存净长, HS=2/FS=1) */
 
@@ -108,9 +113,9 @@ static uint8_t _hid_ep_send_one(void)
     uint8_t  spdHS;
 
     /* 端点必须空闲(NAK)才可装载 */
-    if( (USBHSD->UEP2_TX_CTRL & USBHS_UEP_T_RES_MASK) != USBHS_UEP_T_RES_NAK ) return 0;
+    if( (USBHSD->UEP2_TX_CTRL & USBHS_UEP_T_RES_MASK) != USBHS_UEP_T_RES_NAK ) { g_ep_busy++; return 0; }
 
-    if(hid_BytesAvail == 0) return 0;
+    if(hid_BytesAvail == 0) { g_ep_empty++; return 0; }
 
     spdHS = (USBHS_DevSpeed == USBHS_SPEED_HIGH);
     bulk  = spdHS ? DEF_USBD_HS_PACK_SIZE : DEF_USBD_FS_PACK_SIZE;
@@ -132,6 +137,8 @@ static uint8_t _hid_ep_send_one(void)
     rd = (uint16_t)((rd + pkg) % DEF_UART_BUF_SIZE);
     hid_RdPtr = rd;
     hid_BytesAvail = (uint16_t)(availo - pkg);
+    g_ep_sent++;
+    g_ep_bytes += pkg;
     return 1;
 }
 

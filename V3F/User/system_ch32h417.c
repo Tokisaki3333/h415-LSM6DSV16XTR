@@ -309,7 +309,7 @@ static void SetSYSCLK_400M_CoreCLK_V5F_400M_V3F_100M_HSE(void)
   {
     /* configure PLL Clock */  
     RCC->PLLCFGR &= (uint32_t)((uint32_t)~(RCC_PLLMUL)); 
-    RCC->PLLCFGR |= (uint32_t)RCC_PLLMUL20;   
+    RCC->PLLCFGR |= (uint32_t)RCC_PLLMUL16;   
     RCC->PLLCFGR &= (uint32_t)((uint32_t)~(RCC_PLL_SRC_DIV)); 
     RCC->PLLCFGR |= (uint32_t)RCC_PLL_SRC_DIV1;
     RCC->PLLCFGR &= (uint32_t)((uint32_t)~(RCC_PLLSRC)); 

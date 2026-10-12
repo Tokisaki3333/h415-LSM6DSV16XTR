@@ -313,6 +313,63 @@
 #define LSM6DSV16X_CTRL7_ALL_OFF        0x00u   /* 本板取值：全部关闭 */
 
 /*==============================================================================
+ * 8c. CTRL8 (17h) —— 加计满量程 + LPF2/HP 配置      page 71/198, Table 67/68/69
+ *
+ *   位序（手册表格最左为 bit7）:
+ *     bit7..5  HP_LPF2_XL_BW[2:0]
+ *     bit4     0   保留，必须为 0
+ *     bit3     XL_DualC_EN
+ *     bit2     0   保留，必须为 0
+ *     bit1..0  FS_XL[1:0]
+ *
+ *   FS_XL: 00=±2g  01=±4g  10=±8g  11=±16g
+ *
+ *   ★ 本板设计：陀螺侧不做任何滤波，加计侧也不使能滤波。
+ *     故 HP_LPF2_XL_BW 保持 000、XL_DualC_EN 保持 0，只改 FS_XL。
+ *     LPF2_XL_EN 保持 0 ⟹ LPF2 整级旁路（见 CTRL9）。
+ *============================================================================*/
+
+#define LSM6DSV16X_CTRL8_FS_XL_2G       0x00u
+#define LSM6DSV16X_CTRL8_FS_XL_4G       0x01u
+#define LSM6DSV16X_CTRL8_FS_XL_8G       0x02u
+#define LSM6DSV16X_CTRL8_FS_XL_16G      0x03u   /* 本板取值：±16 g */
+#define LSM6DSV16X_CTRL8_XL_DUALC_EN    0x08u   /* 双通道模式，保持 0 */
+
+/* HP_LPF2_XL_BW[2:0] 在 bit7..5（仅 LPF2_XL_EN=1 时有效，本板不用） */
+#define LSM6DSV16X_CTRL8_BW_ODR_DIV_4   0x00u
+#define LSM6DSV16X_CTRL8_BW_ODR_DIV_10  0x20u
+#define LSM6DSV16X_CTRL8_BW_ODR_DIV_20  0x40u
+#define LSM6DSV16X_CTRL8_BW_ODR_DIV_45  0x60u
+#define LSM6DSV16X_CTRL8_BW_ODR_DIV_100 0x80u
+#define LSM6DSV16X_CTRL8_BW_ODR_DIV_200 0xA0u
+#define LSM6DSV16X_CTRL8_BW_ODR_DIV_400 0xC0u
+#define LSM6DSV16X_CTRL8_BW_ODR_DIV_800 0xE0u
+
+/*==============================================================================
+ * 8d. CTRL9 (18h) —— 加计 LPF2 通路选择             page 72/198, Table 70/71
+ *
+ *   位序:
+ *     bit7     0   保留，必须为 0
+ *     bit6     HP_REF_MODE_XL
+ *     bit5     XL_FASTSETTL_MODE
+ *     bit4     HP_SLOPE_XL_EN        0=低通路径  1=高通/斜率路径
+ *     bit3     LPF2_XL_EN            0=第一级数字滤波输出  1=LPF2 第二级输出
+ *     bit2     0   保留，必须为 0
+ *     bit1     USR_OFF_W
+ *     bit0     USR_OFF_ON_OUT
+ *
+ *   ★ 本板设计不使能任何滤波 ⟹ 本寄存器写 0x00（全 0），保持第一级输出。
+ *     下面这些宏只为将来需要时可用，当前初始化不写非零值。
+ *============================================================================*/
+#define LSM6DSV16X_CTRL9_HP_REF_MODE_XL  0x40u
+#define LSM6DSV16X_CTRL9_XL_FASTSETTL    0x20u
+#define LSM6DSV16X_CTRL9_HP_SLOPE_XL_EN  0x10u
+#define LSM6DSV16X_CTRL9_LPF2_XL_EN      0x08u
+#define LSM6DSV16X_CTRL9_USR_OFF_W       0x02u
+#define LSM6DSV16X_CTRL9_USR_OFF_ON_OUT  0x01u
+#define LSM6DSV16X_CTRL9_ALL_OFF         0x00u   /* 本板取值：全不使能 */
+
+/*==============================================================================
  * 9. UI_CTRL1_OIS (70h) —— OIS 链使能
  *   Table 202，bit7..bit0:
  *     0 | 0 | SIM_OIS | 0 | 0 | OIS_XL_EN | OIS_G_EN | SPI2_READ_EN

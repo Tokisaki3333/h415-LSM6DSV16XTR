@@ -62,7 +62,8 @@ typedef struct {
 typedef struct {
     chan_hdr_t hdr;                     /* 12 B */
     volatile int32_t mx, my, mz;        /* 18 位原始值 */
-} mmc_chan_t;                           /* 24 B */
+    volatile uint8_t pol;               /* 本拍极性：0=SET 1=RESET */
+} mmc_chan_t;                           /* 28 B（含对齐）*/
 
 /* ---- BMP388 气压计：float 直通 ---- */
 typedef struct {
@@ -151,6 +152,18 @@ typedef struct {
                                          * 落空，陀螺 INT 锁存后就再无上升沿。 */
     volatile uint32_t mmc_start_cnt;    /* 地磁 DRDY 次数（V3F 写、V5F 读）。
                                          * 地磁不走 DMA，这个计数就是它的实际采样率。 */
+    /* 地磁失效恢复诊断（V3F 的恢复路径写、V5F 只读上报）。
+     * 失效机理见 V3F/User/main.c 的 MMC_RecoverPoll 说明：
+     *   ISR 里"清输出锁存"那一次写若没生效，INT 恒高、EXTI 再无上升沿，
+     *   ISR 永不进入 ⟹ g_mmc_isr_cnt 与三轴一起冻结，且软件侧无入口可救。
+     * 判读：
+     *   mmc_recover_cnt 涨、reinit 不涨          → 第 1 级(清锁存)有效
+     *   两者都涨                                  → 第 2 级(软件复位)也执行了
+     *   reinit 持续涨且 mmc_last_reinit_rc != 0   → SPI/器件层面更严重，看返回码
+     *   recover 完全不涨但地磁仍冻结              → ISR 还在跑而数据不更新，另一条路径 */
+    volatile uint32_t mmc_recover_cnt;      /* 第 1 级(清锁存)触发次数 */
+    volatile uint32_t mmc_reinit_cnt;       /* 第 2 级(软件复位)触发次数 */
+    volatile uint32_t mmc_last_reinit_rc;   /* 最近一次 MMC_Init 返回码（bit7 置位 = 后续 Enable 失败）*/
     log_chan_t        log;
     imu_chan_t        imu;              /* LSM6DSV16X 六轴 + 温度 */
     mmc_chan_t        mmc;              /* MMC5983MA 三轴 18 位原始值 */
@@ -188,12 +201,13 @@ static inline void shm_publish_imu(uint64_t ts_drdy,
     g_shm->imu.hdr.cnt++;
 }
 
-/* MMC5983MA：18 位原始值直通，不做换算（标定参数未定） */
-static inline void shm_publish_mmc(uint64_t ts_drdy, int32_t mx, int32_t my, int32_t mz)
+/* MMC5983MA：18 位原始值 + SET/RESET 极性直通，不做任何换算或修正 */
+static inline void shm_publish_mmc(uint64_t ts_drdy, int32_t mx, int32_t my, int32_t mz, uint8_t pol)
 {
     g_shm->mmc.mx = mx;
     g_shm->mmc.my = my;
     g_shm->mmc.mz = mz;
+    g_shm->mmc.pol = pol;
     shm_chan_ts_write(&g_shm->mmc.hdr, ts_drdy);
     g_shm->mmc.hdr.cnt++;
 }

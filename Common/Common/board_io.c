@@ -471,6 +471,11 @@ volatile uint64_t g_imu_drdy_ts  = 0u;   /* 本拍 DRDY 时刻（10ns）*/
 /* 当前拍的极性：0 = SET（连续 + 自动 SET），1 = RESET（单次触发） */
 static volatile uint8_t s_polarity = 0u;
 
+/* ★ 每 MMC_FLIP_PERIOD 个 SET 周期才做一次 RESET 周期（原实现为每拍翻转）。
+ *   复位后由 RESET 分支清零，重新累计。 */
+#define MMC_FLIP_PERIOD         1024u
+static volatile uint32_t s_mmc_flip_cnt = 0u;
+
 /* 上一周期的 RESET 样本（暂存），与下一周期首个 SET 配对 —— 归档同一机制。
  * 配对窗口约 623us，是 SET/RESET 之间时间上最接近的一对。 */
 static int32_t  s_pend_rst[3] = {0, 0, 0};
@@ -508,10 +513,12 @@ void EXTI7_0_IRQHandler(void)
             g_mmc_raw[2] = (int32_t)MMC5983MA_XYZ_Z(d[4], d[5], d[6]);
 
             /* 发布到共享区，供 V5F 在陀螺 DMA 中断里轮询取用。
-             * 屏障由 shm_chan_ts_write 内的 __sync_synchronize 提供。 */
+             * 屏障由 shm_chan_ts_write 内的 __sync_synchronize 提供。
+             * ★ 第 5 个参数是【本拍极性】：mipc_shm.h 的 shm_publish_mmc 需要它。 */
             if (g_shm != 0)
                 shm_publish_mmc(g_mmc_drdy_ts,
-                                g_mmc_raw[0], g_mmc_raw[1], g_mmc_raw[2]);
+                                g_mmc_raw[0], g_mmc_raw[1], g_mmc_raw[2],
+                                s_polarity);
         }
         else
         {
@@ -537,8 +544,26 @@ void EXTI7_0_IRQHandler(void)
             s_have_rst = 0u;
         }
 
-        /* --- 4) 决定下一拍 --- */
-        if (s_polarity == 0u)
+        /* --- 4) 决定下一拍 ---
+         * ★ 唯一改动：由"每拍翻转"改为"每 MMC_FLIP_PERIOD 个 SET 周期才做一次 RESET 周期"。
+         *   SET 分支（s_polarity==0，本拍是 SET）：连续走 MMC_FLIP_PERIOD 次，
+         *     第 MMC_FLIP_PERIOD 次才切到 RESET 段；
+         *   RESET 分支（s_polarity==1，本拍是 RESET）：只走一次就切回 SET 段。
+         *   两个分支体内的寄存器操作与等待【一字未改】，仅由计数器决定何时进入。 */
+        if (s_mmc_flip_cnt < MMC_FLIP_PERIOD)
+        {
+            /* 仍处于连续 SET 段：不发 RESET 脉冲、不切状态，
+             * 但【必须照常触发下一次测量】—— 器件是单次触发模式
+             * （CTRL2 不带 CMM_EN），不触发就没有新样本。
+             * 触发器沿用本文件 RESET 分支里已有的那一行，一字不改。 */
+            (void)SPI_WriteReg(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN,
+                               MMC5983MA_REG_CTRL0,
+                               (uint8_t)(MMC5983MA_CTRL0_TM_M |
+                                         MMC5983MA_CTRL0_INT_MEAS_EN |
+                                         MMC5983MA_CTRL0_AUTO_SR_EN));
+            s_mmc_flip_cnt++;
+        }
+        else if (s_polarity == 0u)
         {
             /* 本拍是 SET。SET 段只取【一个】样本，
              * 接下来要切到 RESET 段（归档 b=1 的等价形式）。
@@ -588,6 +613,8 @@ void EXTI7_0_IRQHandler(void)
                                          MMC5983MA_CTRL0_INT_MEAS_EN |
                                          MMC5983MA_CTRL0_AUTO_SR_EN));
 
+            /* ★ 本次 RESET 周期结束：计数清零，接下来重新累计 MMC_FLIP_PERIOD 个 SET 周期 */
+            s_mmc_flip_cnt = 0u;
             s_polarity = 0u;
         }
     }
@@ -811,6 +838,17 @@ int BOARD_IMU_Init(void)
      *    代价是噪声升到约 81 mdps RMS。陀螺要积分，群延迟直接变姿态误差。 */
     if (SPI_WriteReg(IMU_SPI_HANDLE(), LSM6DSV16X_REG_CTRL7,
                      LSM6DSV16X_CTRL7_ALL_OFF) != 0)
+        return LSM6_ERR_SPI;
+
+    /* 7b) ★ 加计满量程：CTRL8.FS_XL = 11 = ±16 g
+     *   原来【漏了这一写】，器件停在复位默认 00 = ±2 g，
+     *   而全链按 ±16 g 的标度 ACCEL_G_PER_LSB = 0.000488 g/LSB 换算，
+     *   于是 |a| 被放大 8 倍（实测静止时读出 8.04 g），
+     *   导致 ESKF 的模长门 | |a| − 1g | < 0.05g 永不满足、启动标定 valid=0、
+     *   ready 始终为 0，整条重力链路失效。
+     *   HP_LPF2_XL_BW 保持 000、XL_DualC_EN 保持 0（本板不做任何滤波）。 */
+    if (SPI_WriteReg(IMU_SPI_HANDLE(), LSM6DSV16X_REG_CTRL8,
+                     LSM6DSV16X_CTRL8_FS_XL_16G) != 0)
         return LSM6_ERR_SPI;
 
     /* 7) DRDY_MASK=1：滤波器建立期间（约 1.86ms）不置 DRDY，

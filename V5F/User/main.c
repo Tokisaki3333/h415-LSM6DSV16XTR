@@ -1,458 +1,205 @@
 /*******************************************************************************
  * main.c —— V5F 大核
+ * 取共享区 -> 姿态处理链 -> justfloat 上报四元数
  *
- * 职责：
- *   ① 从 IPC_MSG0 取共享区地址（V3F 启动时写入）
- *   ② 等 V3F 置 v3f_cfg_done（V3F 停止 printf、开始连续采集）
- *   ③ 配好陀螺 SPI2 的 RX DMA 通道（指向本核的 rxfifo）
- *   ④ 每秒打印一次：陀螺 + 地磁 + 时间戳
+ * ★ USB CDC 上【只有】justfloat 裸帧，不混任何 TYPE/SEQ/CRC 包。
+ *   printf 走 USART1（WCH-Link 那路），与 CDC 是两条独立物理链路。
  *
- * 数据来源：
- *   陀螺 —— 本核的 DMA1_Channel4 完成中断解析 rxfifo 后发布到共享区
- *   地磁 —— V3F 在自己的 DRDY 中断里发布到共享区（本核只读）
+ *   justfloat 帧 = 0x7F800000, 0x7F800000, 1.0, seq, qw,qx,qy,qz, mag_fix, grav_fix, gyro_ok
+ *   10 个 float32 = 40 B/帧，@ 约 100 Hz（7.68 kHz / 77）
  *
- * 不碰 SPI 的初始化与片选（V3F 负责），也不碰 SDMMC / 气压 I2C / GPS。
+ * ★ 本版姿态 = 陀螺零偏追踪 + 直接积分（修正环已关闭，用于单独检查这条链路）。
+ *
+ * ★ 地磁隔离实验：每 MAG_ISO_PERIOD_S 秒翻转 g_proc.mag_corr_en
+ *   （开 5 s / 关 5 s），通道 6 的 mag_fix 直接标注当前状态，
+ *   一眼即可对照"只靠陀螺+重力"与"加入地磁"两种姿态。
  *******************************************************************************/
 #include "debug.h"
 #include "ch32h417.h"
 #include "sys_clk.h"
 #include "mipc_v5.h"
-#include "board_io.h"      /* BOARD_IMU_Init / BOARD_IMU_Enable */
+#include "board_io.h"
 #include "mipc_shm.h"
 #include "sensor_dma.h"
-#include "sdmmc_sd.h"      /* SD_Init / SD_ReadDisk / SD_WriteDisk */
 #include "USBCDC.h"
-#include "cdc_report.h"
+#include "justfloat.h"
+#include "proc.h"
+#include "proc_tune.h"
 
-/*==============================================================================
- * 全速采集 -> 写 TF 卡 -> 读回 -> 串口转发
- *
- * 为什么经卡中转：采集侧带宽约 199 KB/s（IMU 7680Hz + MMC 1024Hz + BMP 42Hz），
- * 而串口只有 86 KB/s。先写卡（实测 15 MB/s），测完再回放。
- *
- * 卡当无文件结构用：直接按扇区读写，不走 FatFS。
- * 帧格式（自同步，PC 端可断流重同步）：
- *   A5 5A | TYPE | LEN | CNT(4) | 净荷 | CHK(XOR)
- *   TYPE 1=IMU 2=MMC 3=BMP 4=EOF
- */
-#define SD_LOG_START_SECTOR     4096u       // 2MB 偏移
-#define SD_LOG_PAD_BYTES        512u        // 前 512B 作校验暂存，同时保证 16B 对齐
-#define SD_LOG_MAX_SECTORS      512u        // 单次最多 256KB
-#define SD_FLUSH_WATERMARK      (224u * 1024u)
-#define SD_CAPTURE_US           (15ULL * 1000000ULL)
-
-/* SD 日志（采集->写卡->回放）开关。USB CDC 使能后 USART1 让位，故默认关闭；
- * 置 1 时需在 main 里重新调用 capture_loop() + replay_to_uart()。 */
-#define V5F_SD_LOG_EN           0u
-
-#define REC_HEAD_SZ             8u          // SYNC(2) TYPE(1) LEN(1) CNT(4)
-#define IMU_PAYLOAD_SZ          18u         // ts_lo(4) + 7 * int16
-#define MMC_PAYLOAD_SZ          16u         // ts_lo(4) + 3 * int32
-#define BMP_PAYLOAD_SZ          20u         // ts_lo(4) + 2 * float + wait_us
-
-enum { REC_IMU = 1, REC_MMC = 2, REC_BMP = 3, REC_EOF = 4 };
-
-// 帧缓冲：
-//   [0, 512)                 : 校验用暂存（读回一个扇区到这，与写出内容比对）
-//   [SD_LOG_PAD_BYTES, ...)  : 记录填充区 / 落卡时的扇区头+数据区
-static uint8_t  s_buf[SD_LOG_MAX_SECTORS * 512u + SD_LOG_PAD_BYTES]
-                __attribute__((aligned(32)));
-static uint32_t s_fill;                     // 已填充字节数
-static uint32_t s_log_sectors;              // 已落卡扇区数
-static uint32_t s_records;                  // 已封装的记录数
-
-// 小端写入辅助
-static void put_u16(uint32_t off, uint16_t v)
-{
-    s_buf[off + 0u] = (uint8_t)v;
-    s_buf[off + 1u] = (uint8_t)(v >> 8);
-}
-
-static void put_u32(uint32_t off, uint32_t v)
-{
-    s_buf[off + 0u] = (uint8_t)v;
-    s_buf[off + 1u] = (uint8_t)(v >> 8);
-    s_buf[off + 2u] = (uint8_t)(v >> 16);
-    s_buf[off + 3u] = (uint8_t)(v >> 24);
-}
-
-// 从回读的扇区头里取字段
-static uint16_t rd_u16(uint32_t off)
-{
-    return (uint16_t)(s_buf[off] | ((uint16_t)s_buf[off + 1u] << 8));
-}
-
-static uint32_t rd_u32(uint32_t off)
-{
-    return (uint32_t)s_buf[off]
-         | ((uint32_t)s_buf[off + 1u] << 8)
-         | ((uint32_t)s_buf[off + 2u] << 16)
-         | ((uint32_t)s_buf[off + 3u] << 24);
-}
-
-// 开一条记录：写帧头（CNT 用共享区的发布计数，便于 PC 查“相邻帧错同”）
-static void rec_begin(uint8_t type, uint32_t cnt, uint8_t payload_len)
-{
-    s_buf[s_fill + 0u] = 0xA5u;
-    s_buf[s_fill + 1u] = 0x5Au;
-    s_buf[s_fill + 2u] = type;
-    s_buf[s_fill + 3u] = payload_len;
-    put_u32(s_fill + 4u, cnt);
-}
-
-// 收尾：算 XOR 校验、推进写指针
-static void rec_end(void)
-{
-    uint32_t len = REC_HEAD_SZ + s_buf[s_fill + 3u];
-    uint8_t  x = 0u;
-    uint32_t i;
-    for (i = 2u; i < len; i++) x ^= s_buf[s_fill + i];
-    s_buf[s_fill + len] = x;
-    s_fill += len + 1u;
-    s_records++;
-}
-
-// ---------------------------------------------------------------------------
-// 日志设备格式：每个扇区 = 16 字节头 + 496 字节数据
-//   头: MAGIC(4) | SEQ(4) | LEN(2) | XOR(2) | RSV(4)
-//   LEN  = 本扇区有效数据字节数（0..496）
-// 这样回放时能逐扇区判定：是否有效、序号是否连续、有没有丢失/重复扇区。
-// 回放时把每个扇区的 LEN 字节数据取出拼接，PC 端拿到的就是纯记录流。
-// ---------------------------------------------------------------------------
-#define SD_SEC_MAGIC    0x354E4C53u     /* "SLN5" */
-#define SD_SEC_HDR      16u
-#define SD_SEC_DATA     (512u - SD_SEC_HDR)
-
-static uint32_t s_sec_seq;              /* 已分配的扇区序号 */
-static uint32_t s_sec_nbad;             /* 写后读回校验失败次数 */
-static uint32_t s_lo;                   /* 本批次原始记录字节的起点（上界用 s_fill） */
-static uint32_t s_pend;                 /* 本次待写入的扇区数 */
-
-#if (V5F_SD_LOG_EN)
-// 打包：把 s_lo..s_fill 的原始记录字节切成 496B 一段，每段前面加 16B 头。
-// 从后往前处理，这样目标位置永远不小于源位置，不会覆盖未处理的数据。
-static void sd_pack_all(void)
-{
-    uint32_t raw = s_fill - s_lo;           /* 原始字节数（上界就是 s_fill） */
-    uint32_t nsec = (raw + SD_SEC_DATA - 1u) / SD_SEC_DATA;
-    uint32_t k;
-
-    for (k = nsec; k > 0u; k--)
-    {
-        uint32_t idx = k - 1u;
-        uint32_t src = s_lo + idx * SD_SEC_DATA;          /* 源起点 */
-        uint32_t dst = SD_LOG_PAD_BYTES + idx * 512u;     /* 目的扇区起点 */
-        uint32_t len = raw - idx * SD_SEC_DATA;
-        uint32_t i;
-        uint16_t x = 0u;
-
-        if (len > SD_SEC_DATA) len = SD_SEC_DATA;
-
-        for (i = len; i > 0u; i--)
-            s_buf[dst + SD_SEC_HDR + i - 1u] = s_buf[src + i - 1u];
-
-        put_u32(dst + 0u, SD_SEC_MAGIC);
-        put_u32(dst + 4u, s_sec_seq + idx);
-        put_u16(dst + 8u, (uint16_t)len);
-        for (i = 0u; i < len; i++) x ^= s_buf[dst + SD_SEC_HDR + i];
-        put_u16(dst + 10u, x);
-        put_u32(dst + 12u, 0u);
-    }
-    s_sec_seq  += nsec;
-    s_pend = nsec;
-}
-
-// 落卡 + 写后读回校验（逐扇区）
-static void sd_flush(void)
-{
-    uint32_t raw = s_fill - s_lo;
-    uint32_t tail, i, k;
-
-    if (raw == 0u) return;
-
-    sd_pack_all();
-
-    // ---- 批量写 ----
-    k = 0u;
-    while (k < s_pend)
-    {
-        uint32_t batch = s_pend - k;
-        if (batch > 255u) batch = 255u;
-        if (SD_WriteDisk(s_buf + SD_LOG_PAD_BYTES + k * 512u,
-                         SD_LOG_START_SECTOR + s_log_sectors + k,
-                         (uint8_t)batch) != SD_OK)
-        {
-            s_sec_nbad++;                   /* 写失败也计入坏扇区 */
-            return;
-        }
-        k += batch;
-    }
-
-    // ---- 写后读回校验：逐扇区读回，与刚写出的内容逐字节比 ----
-    for (k = 0u; k < s_pend; k++)
-    {
-        const uint8_t *wr = s_buf + SD_LOG_PAD_BYTES + k * 512u;
-        if (SD_ReadDisk(s_buf, SD_LOG_START_SECTOR + s_log_sectors + k, 1u) != SD_OK)
-        {
-            s_sec_nbad++;
-            continue;
-        }
-        for (i = 0u; i < 512u; i++)
-        {
-            if (s_buf[i] != wr[i]) { s_sec_nbad++; break; }
-        }
-    }
-
-    s_log_sectors += s_pend;
-
-    /* 诊断：每次落卡都报一次，定位"写作是否真的发生" */
-    printf("FLUSH,raw=%u,sec=%u,log=%u,bad=%u\r\n",
-           (unsigned)raw, (unsigned)s_pend,
-           (unsigned)s_log_sectors, (unsigned)s_sec_nbad);
-
-    // ---- 把不足 SD_SEC_DATA 的尾部搬到 pad 之后，下一轮继续累积 ----
-    tail = raw % SD_SEC_DATA;
-    if (tail > 0u)
-    {
-        uint32_t src = s_lo + raw - tail;
-        uint32_t dst = SD_LOG_PAD_BYTES;
-        for (i = 0u; i < tail; i++) s_buf[dst + i] = s_buf[src + i];
-    }
-    s_lo   = SD_LOG_PAD_BYTES;
-    s_fill = SD_LOG_PAD_BYTES + tail;
-    s_pend = 0u;
-}
-
-
-// 采集：从共享区取三路数据，按帧封装，水位到就落卡
-static void capture_loop(uint32_t dur_us)
-{
-    uint64_t t_end = GetTime64_Us() + dur_us;
-    uint32_t lu = 0u, lm = 0u, lb = 0u;   // 上次见过的发布计数
-
-    while ((int64_t)(t_end - GetTime64_Us()) > 0)
-    {
-        // ---- IMU：tp,gx,gy,gz,ax,ay,az，全部 int16 原始值 ----
-        if (g_shm->imu.hdr.cnt != lu)
-        {
-            lu = g_shm->imu.hdr.cnt;
-            if (s_fill + REC_HEAD_SZ + IMU_PAYLOAD_SZ + 1u < sizeof(s_buf))
-            {
-                rec_begin(REC_IMU, lu, IMU_PAYLOAD_SZ);
-                put_u32(s_fill + REC_HEAD_SZ, g_shm->imu.hdr.ts_lo);
-                put_u16(s_fill + REC_HEAD_SZ + 4u,  (uint16_t)g_shm->imu.temp_raw);
-                put_u16(s_fill + REC_HEAD_SZ + 6u,  (uint16_t)g_shm->imu.gx);
-                put_u16(s_fill + REC_HEAD_SZ + 8u,  (uint16_t)g_shm->imu.gy);
-                put_u16(s_fill + REC_HEAD_SZ + 10u, (uint16_t)g_shm->imu.gz);
-                put_u16(s_fill + REC_HEAD_SZ + 12u, (uint16_t)g_shm->imu.ax);
-                put_u16(s_fill + REC_HEAD_SZ + 14u, (uint16_t)g_shm->imu.ay);
-                put_u16(s_fill + REC_HEAD_SZ + 16u, (uint16_t)g_shm->imu.az);
-                rec_end();
-            }
-        }
-        // ---- 地磁：mx,my,mz（18 位原始值放在 int32）----
-        if (g_shm->mmc.hdr.cnt != lm)
-        {
-            lm = g_shm->mmc.hdr.cnt;
-            if (s_fill + REC_HEAD_SZ + MMC_PAYLOAD_SZ + 1u < sizeof(s_buf))
-            {
-                rec_begin(REC_MMC, lm, MMC_PAYLOAD_SZ);
-                put_u32(s_fill + REC_HEAD_SZ, g_shm->mmc.hdr.ts_lo);
-                put_u32(s_fill + REC_HEAD_SZ + 4u,  (uint32_t)g_shm->mmc.mx);
-                put_u32(s_fill + REC_HEAD_SZ + 8u,  (uint32_t)g_shm->mmc.my);
-                put_u32(s_fill + REC_HEAD_SZ + 12u, (uint32_t)g_shm->mmc.mz);
-                rec_end();
-            }
-        }
-        // ---- 气压：float t/p，直接按位搬 ----
-        if (g_shm->bmp.hdr.cnt != lb)
-        {
-            lb = g_shm->bmp.hdr.cnt;
-            if (s_fill + REC_HEAD_SZ + BMP_PAYLOAD_SZ + 1u < sizeof(s_buf))
-            {
-                union { float f; uint32_t u; } cv;
-                rec_begin(REC_BMP, lb, BMP_PAYLOAD_SZ);
-                put_u32(s_fill + REC_HEAD_SZ, g_shm->bmp.hdr.ts_lo);
-                cv.f = g_shm->bmp.temp_celsius;  put_u32(s_fill + REC_HEAD_SZ + 4u,  cv.u);
-                cv.f = g_shm->bmp.press_pascal;  put_u32(s_fill + REC_HEAD_SZ + 8u,  cv.u);
-                put_u32(s_fill + REC_HEAD_SZ + 12u, g_shm->bmp.wait_us);
-                rec_end();
-            }
-        }
-
-        if (s_fill >= SD_FLUSH_WATERMARK) sd_flush();
-    }
-
-    // 收尾：补一条 EOF（带总扇区数与总记录数），再落卡
-    if (s_fill + REC_HEAD_SZ + 8u + 1u < sizeof(s_buf))
-    {
-        rec_begin(REC_EOF, 0u, 8u);
-        put_u32(s_fill + REC_HEAD_SZ, s_log_sectors);
-        put_u32(s_fill + REC_HEAD_SZ + 4u, s_records);
-        rec_end();
-    }
-    sd_flush();
-}
-
-// 回放：逐扇区校验头，只把有效数据段发给 PC（PC 收到的是纯记录流）
-static void replay_to_uart(void)
-{
-    uint32_t sec;
-    for (sec = 0u; sec < s_log_sectors; sec++)
-    {
-        const uint8_t *h;
-        uint32_t len, i;
-
-        if (SD_ReadDisk(s_buf, SD_LOG_START_SECTOR + sec, 1u) != SD_OK)
-        {
-            printf("REPLAY_FAIL,sector=%u\r\n", (unsigned)(SD_LOG_START_SECTOR + sec));
-            return;
-        }
-        h = s_buf;
-
-        if (rd_u32(0u) != SD_SEC_MAGIC)     /* 扇区无效 -> 只报，不发 */
-        {
-            printf("BADSEC,seq=%u\r\n", (unsigned)sec);
-            continue;
-        }
-        len = rd_u16(8u);
-        if (len > SD_SEC_DATA) len = SD_SEC_DATA;
-        for (i = 0u; i < len; i++)
-        {
-            while ((USART1->STATR & 0x80u) == 0u) { }
-            USART1->DATAR = s_buf[SD_SEC_HDR + i];
-        }
-    }
-    while ((USART1->STATR & 0x40u) == 0u) { }   // 等最后一位发完
-}
-
-
-#endif /* V5F_SD_LOG_EN */
+/* ★ 上报模式：QUAT 帧（4 float 四元数 + 帧尾 2×sync = 24 B），IMU 满速率。
+ *   本版唯一上报流 —— 【只上报四元数】，帧长恒定 24 B，
+ *   绝不混入任何其它数据。帧尾的两次 00 00 80 7F 是唯一标识。 */
+#define ATT_DIV             1u      /* 满速率：7.67 kHz 上报 */
 
 int main(void)
 {
-    uint32_t last_imuc = 0u;
-    uint32_t last_imustart = 0u;
-    uint32_t last_mmcc = 0u;
-    uint32_t last_pubmc = 0u;
-    uint32_t last_bmpc = 0u;
+    uint32_t last_imu_cnt = 0u;
+    uint32_t last_mmc_cnt = 0u;
+    uint32_t att_div      = 0u;
+    uint32_t skip_cnt     = 0u;      /* 主循环跟丢的采样数（cnt 跳号累计） */
+    uint32_t prev_imu_cnt = 0u;
+    int32_t  mx = 0, my = 0, mz = 0;
+    uint8_t  mpol = 0u;
     uint64_t t_next;
-    uint64_t t_cap0 = 0u;
+    /* ★ 原始磁 counts 上报用：当前拍 + 上一拍（含各自极性），PC 据此重建 SET/RESET 对 */
+    int32_t  m_cur_raw[3]  = {0, 0, 0};
+    int32_t  m_prev_raw[3] = {0, 0, 0};
+    uint8_t  pol_cur = 0u, pol_prev = 0u;
+    uint8_t  mmc_seen = 0u, mmc_prev_valid = 0u;
 
     SystemAndCoreClockUpdate();
     Delay_Init();
 
-    printf("\r\n[V5F] start\r\n");
+    printf("\r\n[V5F] start (justfloat QUAT 24B)\r\n");
 
-    /* 取共享区地址。必须在 RX DMA 使能之前完成 —— 否则 g_shm 还是 NULL，
-     * 完成中断里的发布会被 if (g_shm) 静默丢弃。 */
-    (void)mipc_v5_get_shared();
+    (void)mipc_v5_get_shared();                         /* 须在 RX DMA 使能前 */
 
-    /* 等 V3F 配好器件并切到"只发布不打印" */
     while (g_shm->v3f_cfg_done == 0u) Delay_Ms(1);
     printf("[V5F] shm=%08X, v3f_cfg_done=%u\r\n",
            (unsigned)(uintptr_t)g_shm, (unsigned)g_shm->v3f_cfg_done);
 
-    /* 配 RX DMA（目标 = 本核 rxfifo）并开完成中断 */
     SPI_DMA_Init();
 
-    /*--------------------------------------------------------------------------
-     * 陀螺由本核（消费方）自己使能
-     *
-     * BOARD_IMU_Init/Enable 在板级配置库里，不依赖任何全局/静态量，
-     * 两核都能调用。由消费方使能是为了保证顺序：
-     *   ① 先把自己的 RX DMA 武装好（SPI_DMA_Init）
-     *   ② 再配置并启动陀螺
-     * 若反过来，陀螺产生 DRDY 时 RX 还没就绪 -> INT 锁存为高 ->
-     * 上升沿再也不来（实测：IMU,hz=2,pub=0）。
-     *------------------------------------------------------------------------*/
     printf("LSM6,init_rc=%d\r\n", BOARD_IMU_Init());
     printf("LSM6,enable_rc=%d\r\n", BOARD_IMU_Enable());
-    printf("[V5F] Ready.\r\n");
+    printf("[V5F] Ready. justfloat = QUAT only (4 float/24B @IMU rate)\r\n");
 
-    /*--------------------------------------------------------------------------
-     * USBHS CDC 上报（使能后 USART1 让位，数据走 CDC 上行）
-     *------------------------------------------------------------------------*/
-    cdc_reset_seq();
+    proc_chain_init();
+
     usbhs_hid_enable();
-    /*--------------------------------------------------------------------------
-     * 主循环：每秒打印一次
-     *------------------------------------------------------------------------*/
-    t_next = GetTime64_Us() + 1000000ULL;
+
+    t_next = GetTime64_Us() + 5000000ULL;
 
     for (;;)
     {
+        /* ---- 排空：必须【每轮】调用，绝不能降频 ----
+         * _hid_ep_send_one() 每次只装 1 个包，hid_up_flush() 只调它一次，
+         * 于是"调用次数"就是"可发出的包数上限"：
+         *   125 次/s × 512 B(HS) = 64 KB/s，远低于需要的 644 KB/s —— 一帧都送不出去。
+         * 驱动敏感的是【提交传输的频率】，不是【检查端点是否空闲的频率】；
+         * 端点忙时 _hid_ep_send_one() 自己返回 0，天然限流。
+         * 所以这里每轮都调，入队节拍交由 jf_agg_poll() 控制。 */
         usbhs_hid_poll();
-        cdc_rx_poll();
 
+        /* ---- 入队节拍：<=125 Hz（JF_AGG_PERIOD_US=8ms）----
+         * 实测 Win10 侧驱动对【提交 USB 传输的频率】敏感：7670 帧/s 逐帧入队时
+         * 丢 27% / 大部分；v2 是 602 B/帧，同样 7670 帧/s 但提交次数只有 1/7，不丢。
+         * 这里让暂存区累积到 8 ms 才整块入队一次，把提交次数降到 <=125 次/s。 */
+        jf_agg_poll();
+
+        /* ---- 保活（0.2 Hz；printf 逐字符忙等，本行 118 字符 @921600 = 1.28 ms）---- */
         if ((int64_t)(t_next - GetTime64_Us()) <= 0)
         {
-            uint32_t ic = g_shm->imu.hdr.cnt;
-            uint32_t mc = g_shm->mmc.hdr.cnt;
-            uint32_t ms = g_shm->mmc_start_cnt;
-            uint32_t bc = g_shm->bmp.hdr.cnt;
+            printf("V5F,imu=%u,mmc=%u,bmp=%u,jf_drop=%u,agg_tx=%u,enq_fail=%u,ep_sent=%u,ep_busy=%u,ep_empty=%u,ep_kb=%u,pend=%u,skip=%u,start=%u,lag=%u,mrec=%u,mreinit=%u,mrc=%u\r\n",
+                   (unsigned)g_shm->imu.hdr.cnt,
+                   (unsigned)g_shm->mmc.hdr.cnt,
+                   (unsigned)g_shm->bmp.hdr.cnt,
+                   (unsigned)g_jf_drop,
+                   (unsigned)g_jf_agg_tx,
+                   (unsigned)g_jf_enq_fail,
+                   (unsigned)g_ep_sent,
+                   (unsigned)g_ep_busy,
+                   (unsigned)g_ep_empty,
+                   (unsigned)(g_ep_bytes / 1024u),
+                   (unsigned)jf_agg_pending(),
+                   (unsigned)skip_cnt,
+                   (unsigned)g_shm->imu_start_cnt,
+                   (unsigned)(g_shm->imu_start_cnt - g_shm->imu.hdr.cnt),
+                   (unsigned)g_shm->mmc_recover_cnt,    /* 第 1 级：清锁存救回次数 */
+                   (unsigned)g_shm->mmc_reinit_cnt,     /* 第 2 级：软件复位次数   */
+                   (unsigned)g_shm->mmc_last_reinit_rc);/* 最近 init 返回码       */
+            t_next = GetTime64_Us() + 5000000ULL;
+        }
 
-            printf("IMU,hz=%u,pub=%u,tim=%u,g=%d,%d,%d,a=%d,%d,%d,tp=%d\r\n",
-                   (unsigned)(g_shm->imu_start_cnt - last_imustart),
-                   (unsigned)(ic - last_imuc),
-                   (unsigned)(g_shm->imu.hdr.ts_lo / 100000ULL),
-                   (int)g_shm->imu.gx, (int)g_shm->imu.gy, (int)g_shm->imu.gz,
-                   (int)g_shm->imu.ax, (int)g_shm->imu.ay, (int)g_shm->imu.az,
-                   (int)g_shm->imu.temp_raw);
+        /* ---- 锁存最新的磁原始值（约 1 kHz 更新） ---- */
+        if (g_shm->mmc.hdr.cnt != last_mmc_cnt)
+        {
+            last_mmc_cnt = g_shm->mmc.hdr.cnt;
+            __sync_synchronize();
+            mx   = g_shm->mmc.mx;
+            my   = g_shm->mmc.my;
+            mz   = g_shm->mmc.mz;
+            mpol = g_shm->mmc.pol;
 
-            /* 气压计：只读共享区，不在采集路径上报 */
-            printf("BARO,pub=%u,tim=%u,t=%.2f,p=%.1f,wait_us=%u\r\n",
-                   (unsigned)(bc - last_bmpc),
-                   (unsigned)(g_shm->bmp.hdr.ts_lo / 100000ULL),
-                   (double)g_shm->bmp.temp_celsius,
-                   (double)g_shm->bmp.press_pascal,
-                   (unsigned)g_shm->bmp.wait_us);
-
-            /* 双核同步标记：pg = v5f_progress, cd = v3f_cfg_done, dr = v5f_dma_ready */
-            printf("SYNC,cd=%u,dr=%u,pg=%u\r\n",
-                   (unsigned)g_shm->v3f_cfg_done,
-                   (unsigned)g_shm->v5f_dma_ready,
-                   (unsigned)g_shm->v5f_progress);
-
-            printf("MMC,hz=%u,pub=%u,tim=%u,raw=%d,%d,%d\r\n",
-                   (unsigned)(ms - last_mmcc),
-                   (unsigned)(mc - last_pubmc),
-                   (unsigned)(g_shm->mmc.hdr.ts_lo / 100000ULL),
-                   (int)g_shm->mmc.mx, (int)g_shm->mmc.my, (int)g_shm->mmc.mz);
-
-            last_imustart = g_shm->imu_start_cnt;
-            last_imuc = ic;
-            last_pubmc = mc;
-            last_mmcc = ms;
-            last_bmpc = bc;
-
-            /* 负载 = 本秒 ISR 总耗时(ns)/1e9*100%，存成 %×100：avg_ns*n/1e7 */
+            /* ★ 原始 counts：先把"当前"挪到"上一拍"，再写入新的当前 */
+            if (mmc_seen != 0u)
             {
-                uint32_t n = 0u, avg = 0u, mx = 0u, ovr = 0u;
-                if (dma_rx_probe_1s(&n, &avg, &mx, &ovr))
+                m_prev_raw[0] = m_cur_raw[0];
+                m_prev_raw[1] = m_cur_raw[1];
+                m_prev_raw[2] = m_cur_raw[2];
+                pol_prev      = pol_cur;
+                mmc_prev_valid = 1u;
+            }
+            m_cur_raw[0] = mx;
+            m_cur_raw[1] = my;
+            m_cur_raw[2] = mz;
+            pol_cur      = mpol;
+            mmc_seen     = 1u;
+        }
+
+        /* ---- 逐 IMU 帧：取走板上每个采样并上报 ---- */
+        if (g_shm->imu.hdr.cnt != last_imu_cnt)
+        {
+            uint64_t ts;
+
+            {
+                uint32_t step = g_shm->imu.hdr.cnt - prev_imu_cnt;
+                if (step > 1u) skip_cnt += (step - 1u);   /* 跳过的采样数 */
+                prev_imu_cnt = g_shm->imu.hdr.cnt;
+            }
+            last_imu_cnt = g_shm->imu.hdr.cnt;
+            __sync_synchronize();
+            ts = shm_chan_ts_read(&g_shm->imu.hdr);     /* 该采样的 DRDY 原始时间戳 */
+
+            proc_chain_step(g_shm);                     /* 处理链照常逐帧跑，与上报无关 */
+
+            att_div++;
+
+            {
+                /* ===== 唯一上报流：FULL 帧（全数据调试，124 B），IMU 满速率 =====
+                 * ★ 帧内含 ESKF 实际用到的全部输入与输出：
+                 *     q(4) + gyro_dps(3) + accel_g(3) + mag_u(3)
+                 *     + flag + t_us + imu_cnt + mmc_cnt + mag_resid + acc_resid
+                 *     + mag_raw_cur(3) + mag_raw_prev(3) + flag2
+                 *   共 2 sync + 31 float = 124 B，帧长恒定，绝不混发其它类型。
+                 * ★ 四元数仍在去掉两个 sync 后的 chan2..chan5，与上位机对齐。
+                 * ★ flag : bit0 mag_valid, bit1 new_mag, bit2 grav_open, bit3 ready
+                 * ★ flag2: bit0 pol_cur, bit1 pol_prev, bit2 mmc_prev_valid,
+                 *          bit3 eskf_ready
+                 * ★ 原始 counts 为 MMC5983MA 18 位（零点 131072），单帧一相，
+                 *   用 (cur, prev) 两拍即可在 PC 端重建 (m_SET, m_RESET) 对。 */
+                (void)att_div;
                 {
-                    uint32_t load = (uint32_t)(((uint64_t)avg * (uint64_t)n) / 10000000ULL);
-                    printf("PRF,isr_hz=%u,avg_ns=%u,max_ns=%u,ovr130=%u,load=%u.%02u%%\r\n",
-                           (unsigned)n, (unsigned)avg, (unsigned)mx, (unsigned)ovr,
-                           (unsigned)(load / 100u), (unsigned)(load % 100u));
+                    float f = 0.0f, f2 = 0.0f;
+                    if (g_proc.mag_valid != 0u)          f += 1.0f;
+                    if (proc_mag_is_new() != 0u)         f += 2.0f;
+                    if (proc_eskf_grav_open() != 0u)     f += 4.0f;
+                    if (proc_eskf_ready() != 0u)         f += 8.0f;
+
+                    if (pol_cur != 0u)                   f2 += 1.0f;
+                    if (pol_prev != 0u)                  f2 += 2.0f;
+                    if (mmc_prev_valid != 0u)            f2 += 4.0f;
+                    if (proc_eskf_ready() != 0u)         f2 += 8.0f;
+
+                    (void)jf_full_push(g_proc.q[0], g_proc.q[1],
+                                       g_proc.q[2], g_proc.q[3],
+                                       g_proc.gyro_dps[0], g_proc.gyro_dps[1], g_proc.gyro_dps[2],
+                                       (float)g_shm->imu.ax * ACCEL_G_PER_LSB,
+                                       (float)g_shm->imu.ay * ACCEL_G_PER_LSB,
+                                       (float)g_shm->imu.az * ACCEL_G_PER_LSB,
+                                       g_proc.mag_u[0], g_proc.mag_u[1], g_proc.mag_u[2],
+                                       f,
+                                       (float)((double)ts * 1e-1),
+                                       (float)(g_shm->imu.hdr.cnt & 0x00FFFFFFu),
+                                       (float)(g_shm->mmc.hdr.cnt & 0x00FFFFFFu),
+                                       proc_eskf_mag_resid(),
+                                       proc_eskf_acc_resid(),
+                                       (float)m_cur_raw[0], (float)m_cur_raw[1], (float)m_cur_raw[2],
+                                       (float)m_prev_raw[0], (float)m_prev_raw[1], (float)m_prev_raw[2],
+                                       f2);
                 }
+                (void)mx; (void)my; (void)mz; (void)mpol;
             }
-
-            {
-                uint8_t pl[PL_STAT];
-                uint32_t v;
-                v = g_cdc_tx_pkts;
-                pl[0]=(uint8_t)v; pl[1]=(uint8_t)(v>>8); pl[2]=(uint8_t)(v>>16); pl[3]=(uint8_t)(v>>24);
-                v = g_cdc_tx_drop;
-                pl[4]=(uint8_t)v; pl[5]=(uint8_t)(v>>8); pl[6]=(uint8_t)(v>>16); pl[7]=(uint8_t)(v>>24);
-                v = g_shm->imu_start_cnt;
-                pl[8]=(uint8_t)v; pl[9]=(uint8_t)(v>>8); pl[10]=(uint8_t)(v>>16); pl[11]=(uint8_t)(v>>24);
-                v = g_shm->mmc_start_cnt;
-                pl[12]=(uint8_t)v; pl[13]=(uint8_t)(v>>8); pl[14]=(uint8_t)(v>>16); pl[15]=(uint8_t)(v>>24);
-                (void)cdc_send(PKT_TYPE_STAT, PKT_FLAG_TSOK, GetTime64_10Ns(), pl, PL_STAT);
-            }
-
-            t_next = GetTime64_Us() + 1000000ULL;
         }
     }
 }

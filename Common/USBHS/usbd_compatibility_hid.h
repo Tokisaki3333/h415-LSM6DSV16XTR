@@ -26,6 +26,10 @@ extern volatile uint16_t Head_Pack_Len;                             // (预留,C
 
 extern uint16_t hid_up_avail(void);                /* 剩余可写字节数 */
 extern uint8_t  hid_up_enqueue(const uint8_t*, uint16_t len); /* 1=入队;0=空间不足放弃 */
+extern volatile uint32_t g_ep_busy;   /* 端点忙导致装包失败 */
+extern volatile uint32_t g_ep_empty;  /* 环内无字节 */
+extern volatile uint32_t g_ep_sent;   /* 实际装包成功 */
+extern volatile uint32_t g_ep_bytes;  /* 累计装出字节 */
 extern void     hid_up_flush(void);                /* 主循环高频:有字节就把 1 个 CDC bulk 包灌 EP2 */
 
 /* ---- 下行（主机→设备）----

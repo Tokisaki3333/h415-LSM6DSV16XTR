@@ -274,7 +274,7 @@ extern volatile uint32_t g_exti_irq_cnt;
  *   3) 按下一拍需要的极性准备器件并触发测量
  *
  * 中断内只搬原始 counts：不碰浮点、不 printf（理由见 board_io.c）。
- * 零偏配对与换算由主循环消费端做。
+ * 只搬原始 counts，不做任何零偏/配对修正。
  *----------------------------------------------------------------------------*/
 extern volatile int32_t  g_mmc_raw[3];      /* X/Y/Z 原始 counts              */
 extern volatile uint8_t  g_mmc_polarity;    /* 本拍极性：0=SET  1=RESET        */
@@ -285,8 +285,6 @@ extern volatile uint64_t g_mmc_drdy_ts;
 /* SET/RESET 配对累加（中断内用"上一拍样本"配对 —— 相邻两拍必然异极性，
  * 是物理时间上最近的一对；按方向硬配会人为拉长窗口）。
  * 主循环每秒取一次：均值 = sum / n，然后清零。 */
-extern volatile int64_t  g_mmc_pair_sum[3];  /* 配对均值累加 */
-extern volatile uint32_t g_mmc_pair_n;       /* 本秒累计对数   */
 
 /*------------------------------------------------------------------------------
  * 陀螺 DRDY 中断的产出（EXTI15_8_IRQHandler 内更新）

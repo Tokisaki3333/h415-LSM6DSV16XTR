@@ -24,8 +24,25 @@
 /* SET/RESET 触发后的固定等待。实测操作本身约 13us，取 100us 留足余量。
  * 不读回 CTRL0 判断完成 —— 它是只写寄存器，读回值不可信。 */
 
-/* 启动时"复位到干净态"的最大重试次数。
+/*------------------------------------------------------------------------------
+ * OTP 就绪探针参数
  *
+ * ★ 全程只操作 MMC5983MA 自己的寄存器，不涉及 MCU 复位。
+ *   "复位"在这里一律指【写器件 CTRL1(0x0A) 的 SW_RST 位(bit7)】，
+ *   让地磁器件自身回到上电初始态；MCU 不复位、不外设复位、不重入 main()。
+ *   连续录制因此不会被打断（只是地磁在这段时间不产生样本）。
+ *
+ * 观测方式：从写完器件 SW_RST 起，以 100us 粒度连续读 STATUS，
+ * 直到 OTP_Rd_Done(0x10) 置起为止。观测窗口必须从 t=0 开始、粒度远细于
+ * 待测事件 —— 旧实现"先固定等 10ms、再 1ms 轮询"报出的 1012us 就是量化误差。
+ *
+ * 实测：OTP 就绪 649us，整段 MMC_Init 1615us（器件已上电很久，只需重读 OTP）。
+ * 因此不再保留任何"固定等待"分支。
+ *------------------------------------------------------------------------------*/
+#define MMC_OTP_PROBE_STEP_US   100u    /* 轮询粒度 */
+#define MMC_OTP_PROBE_MAX       600u    /* 最多 600 次 × 100us = 最长观测 60ms */
+
+/* 启动时"复位到干净态"的最大重试次数。 *
  * 实测器件会带着上次运行的残留状态启动，且【单次 SW_RST + 10ms 可能不到位】
  * （复位后 STATUS 仍为 0x11 而不是 0x10，此时写 STATUS 清位也无效）。
  * 每轮重试 = 写 SW_RST + 等 10ms + 等 OTP + 清完成标志 + 复核，
@@ -92,6 +109,10 @@ int MMC_Init(void)
 {
     uint8_t  v = 0u;
     uint32_t i;
+    uint64_t t_rst0    = 0u;    /* 本复位轮次的起点 */
+    uint64_t otp_wait_us = 0u;  /* 本复位轮次的 OTP 等待耗时 */
+    uint64_t otp_max_us  = 0u;  /* 所有轮次里的 OTP 最大等待 */
+    uint64_t t_init0     = GetTime64_Us();  /* 整个 MMC_Init 的起点 */
 
     /* 0) ★ 软件复位：把器件拉回已知状态
      *
@@ -109,27 +130,51 @@ int MMC_Init(void)
      * 【为什么一遍不够，要重试】
      *   实测单次 SW_RST + 10ms 之后，STATUS 仍可能是 0x11（复位没到位），
      *   此时写 STATUS 清位也无效。做法是：
-     *     复位 -> 等 10ms -> 等 OTP -> 清完成标志 -> 复核
+     *     复位 -> 等 OTP 就绪 -> 清完成标志 -> 复核
      *   若复核结果不是 0x10，就【整个重来一遍】，最多 MMC_RST_TRY 次。
      *   每轮重试都是幂等的（写常量、不复位状态机），可以安全重复。
+     *
+     * 【不再固定等待 10ms —— 实测不需要】
+     *   这里只写【器件 CTRL1 的 SW_RST 位】，让地磁器件自身复位，不涉及 MCU。
+     *   手册把 10ms 标为 power-on time（真正上电到可用的时间）；而本函数在启动
+     *   流程里被调用时器件早已上电很久，SW_RST 只是让它重读 OTP。
+     *   实测（100us 粒度、从写完 SW_RST 起连续观测）：
+     *       OTP 就绪 = 649us，整段 MMC_Init = 1615us
+     *   而旧实现"固定等 10ms + 1ms 粒度轮询"报出的 rd=11018us / 全程 11924us，
+     *   其中 10ms 是白等、1.012ms 是轮询量化误差 —— 都不是器件的真实需求。
      *------------------------------------------------------------------------*/
     for (i = 0u; i < MMC_RST_TRY; i++)
     {
+        t_rst0 = GetTime64_Us();        /* 本复位轮次起点 */
         if (mmc_wr(MMC5983MA_REG_CTRL1, MMC5983MA_CTRL1_SW_RST) != 0)
             return MMC_ERR_SPI;
-        HWT_DelayMs(10u);               /* 手册要求 10ms 上电时间 */
 
-        /* 等 OTP 就绪（复位后芯片要重读内部 OTP，期间可能读回 0xFF）*/
+        /* 从写完 SW_RST 起就以 100us 粒度连续观测 OTP 就绪。
+         * 观测窗口必须从 t=0 开始、且粒度远细于待测事件（实测约 650us），
+         * 否则会把量化误差当成物理量 —— 这正是旧实现报 1012us 的原因。 */
         {
             uint32_t k;
-            for (k = 0u; k < 100u; k++)
+            for (k = 0u; k < MMC_OTP_PROBE_MAX; k++)
             {
                 if (mmc_rd(MMC5983MA_REG_STATUS, &v) == 0 &&
                     (v & MMC5983MA_ST_OTP_RD_DONE))
                     break;
-                HWT_DelayUs(1000u);
+                HWT_DelayUs(MMC_OTP_PROBE_STEP_US);
             }
-            if (k >= 100u)
+            otp_wait_us = GetTime64_Us() - t_rst0;   /* 从 SW_RST 起的真实耗时 */
+            if (otp_wait_us > otp_max_us)
+                otp_max_us = otp_wait_us;
+
+            /* rd_us  = 从写完 SW_RST 到第一次读到 OTP 就绪的【真实】耗时
+             * ok_us  = 同上（保留同名字段便于对照旧日志）
+             * polls  = 轮询次数（×100us 即耗时，用于确认粒度生效）
+             * done   = 命中时的 STATUS（0x10 = 就绪）*/
+            printf("MMC,otp,rd_us=%u,ok_us=%u,polls=%u,try=%u,done=0x%02X\r\n",
+                   (unsigned)otp_wait_us,
+                   (unsigned)(GetTime64_Us() - t_rst0),
+                   (unsigned)k, (unsigned)i, (unsigned)v);
+
+            if (k >= MMC_OTP_PROBE_MAX)
                 return MMC_ERR_OTP_TIMEOUT;
         }
 
@@ -152,6 +197,15 @@ int MMC_Init(void)
     if (i >= MMC_RST_TRY)
         printf("MMC,reset,NOT_CLEAN_after_%u_tries,status=0x%02X\r\n",
                (unsigned)MMC_RST_TRY, (unsigned)v);
+
+    /* 本次 MMC_Init 的耗时小结。
+     * otp_us 的语义取决于探针模式:
+     *   细粒度模式 = 从写完 SW_RST 到 OTP 就绪的真实耗时（us）
+     *   保守模式   = 只统计"固定等待之后"那一段轮询耗时（us） */
+    printf("MMC,init_t,otp_us=%u,total_us=%u,tries=%u\r\n",
+           (unsigned)otp_max_us,
+           (unsigned)(GetTime64_Us() - t_init0),
+           (unsigned)(i + 1u));
 
     /* 2) Product ID 校验 */
     v = 0u;
@@ -209,9 +263,10 @@ int MMC_ClearLatch(void)
      * 把整个流程打断。器件在"收到写"之后需要恢复时间，
      * 紧贴着发读命令是不成立的。
      *
-     * 【本函数会被主循环每帧调用】所以这里【不能打印】——
-     * 轮询清锁存时每次打一行会把串口刷屏，掩盖真正要看的数据。
-     * 清锁存是否生效由调用方通过引脚电平自行观察。 */
+     * 【本函数由 V3F 主循环的恢复路径调用】所以这里【不能打印】——
+     * 一旦需要反复重试，每次打一行会把串口刷屏，掩盖真正要看的数据。
+     * 清锁存是否生效由调用方通过引脚电平自行观察。
+     * 注意：本函数【只在启动时和恢复路径里】被调用，不是每帧调用。 */
     if (SPI_WriteReg(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN, MMC5983MA_REG_STATUS,
                      (uint8_t)(MMC5983MA_ST_MEAS_M_DONE |
                                MMC5983MA_ST_MEAS_T_DONE)) != 0)
