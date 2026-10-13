@@ -109,6 +109,17 @@ void DMA1_Channel4_IRQHandler(void)
 
         if (g_shm != 0)
         {
+            /* ★★ 在中断【入口处】取 DRDY 时刻（2026-10-13）。
+             * 该时刻由 V3F 在 DRDY 中断里写进共享区（board_io.c 的 EXTI15_8_IRQHandler），
+             * 本处只做拾取 —— 这是跨核唯一可行的通路。
+             * ★ 不能在解析之后取：原实现（GetTime64_10Ns()）把发布时间拖到
+             *   DRDY + SPI传输(~12us) + 中断延迟 + 解析耗时，后三项都抖动
+             *   ⟹ 实测逐帧 Δt 散布 ±20~30%（真实帧间隔仅 130.25us）。
+             *   dt 是每次角速度积分的乘数，抖动直接注入姿态误差。
+             * ★ 也不能直接引用 g_imu_drdy_ts：那属于 V3F 镜像，V5F 读到的是自己的初值 0
+             *   （board_io.c 在 Common/Common，两个核各编译一份）。
+             * 先读、后解析，使本时刻与 DmaBuf 里这一帧的配对窗口最小。 */
+            uint64_t ts_drdy = shm_chan_ts_read(&g_shm->imu_drdy);
             /* 布局见 sensor_dma.h：[1..2]温度 [3..8]陀螺 [9..14]加计，低字节在前 */
             int16_t tp = (int16_t)(((uint16_t)rxfifo[2]  << 8) | rxfifo[1]);
             int16_t gx = (int16_t)(((uint16_t)rxfifo[4]  << 8) | rxfifo[3]);
@@ -118,9 +129,10 @@ void DMA1_Channel4_IRQHandler(void)
             int16_t ay = (int16_t)(((uint16_t)rxfifo[12] << 8) | rxfifo[11]);
             int16_t az = (int16_t)(((uint16_t)rxfifo[14] << 8) | rxfifo[13]);
 
-            /* DRDY 时刻：本帧 DRDY 到数据搬完只隔一次传输（约 12us），
-             * 故取中断进入时刻作为发布的时间戳。 */
-            shm_publish_imu(GetTime64_10Ns(), tp, gx, gy, gz, ax, ay, az);
+            /* ★ 发布 DRDY 时刻（不是发布时刻）。ts_drdy 已在中断入口处从共享区取好。
+             *   若为 0（V3F 尚未写过）则退回本核当前时刻，避免 dt_s=0 让链路停摆。 */
+            shm_publish_imu((ts_drdy != 0u) ? ts_drdy : GetTime64_10Ns(),
+                            tp, gx, gy, gz, ax, ay, az);
 
             {
             }

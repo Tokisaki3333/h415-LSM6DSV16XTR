@@ -74,12 +74,54 @@
  *   float[23..25] mag_raw_cur[3]     本拍原始 counts（18 位）
  *   float[26..28] mag_raw_prev[3]    上一拍原始 counts
  *   float[29]    flag2  bit0 pol_cur, bit1 pol_prev,
- *                       bit2 mmc_prev_valid, bit3 ready
- *   共 30 float = 120 B，帧长恒定。
- *   ★ 全部原始输入都在帧内，PC 可逐帧重放。 */
-#define JF_FULL_NFLOATS     30u
-#define JF_FULL_BYTES       (JF_FULL_NFLOATS * 4u)  /* 92 B */
-#define JF_FULL_WIRE_BYTES  120u
+ *                       bit2 mmc_prev_valid, bit3 ready,
+ *                       ★ bit4 layout_v2 (=1 表示含 [30..32] 零偏字段)
+ *   float[30..32] gyro_bias_dps[3]    ★ 追踪器当前零偏估计（dps）
+ *   float[33]    acc_thr              ★ 自适应重力残差门限（纯历史量）
+ *   float[34..36] Pxx,Pyy,Pzz         协方差对角
+ *   float[37..39] Pxy,Pxz,Pyz         协方差非对角（重力→偏航泄漏通道）
+ *   float[40]    calib_n              启动标定累计样本数
+ *   float[41]    ts_lo24              ★ v4：GetTime64_10Ns() 的低 24 位
+ *   共 42 float = 168 B，帧长恒定。
+ *
+ *   ★ v4 时戳精度（2026-10-13）：
+ *     原 [18] 写 (float)((double)ts*1e-1)。float32 在 3.6e8 量级的步长为 32，
+ *     即【上报粒度只有 3.2 us】；而帧间隔 ≈130 us ⟹ 报出来的 dt 有 2.5% 量化误差。
+ *     实测逐帧 Δt 散布 ±30%（中位 1304、1%~99% 为 1040~1568、相邻唯一值差 768），
+ *     完全无法用来算 dt —— 这是纯上报缺陷，固件内部用原始 u64 不受影响。
+ *
+ *   ★★ 编码方式（必须有，勿改）：【数值拆分，且必须拆在 2^24，不能用按位拷贝】
+ *       [18] = ts >> 24            (高位)
+ *       [41] = ts & 0xFFFFFF       (低位, 24 位)
+ *       还原: ts = (u64)F[18] * 16777216ULL + (u64)F[41]
+ *
+ *     为什么【不能】按位拷贝到伪 float：
+ *       justfloat 同步字 00 00 80 7F (小端) = float 0x7F800000 = +Infinity。
+ *       按位拷贝会让该字段遍历每一个 u32 值 ⟹ 0x7F800000 必然被命中
+ *       （每 2^32 × 10ns = 42.9 s 一次），上位机把数据误判为帧头 ⟹ 错位/卡死。
+ *       这是结构性必然，不是概率问题。
+ *     为什么拆在 2^24 就安全：
+ *       float32 尾数 24 位 ⟹ [0, 2^24) 与 2^24 的倍数都【精确可表示】⟹ 无损；
+ *       两者都是有限整数 ⟹ 位型永远到不了 0x7F800000(+Inf)，也到不了 NaN。
+ *       精确上限 ts < 2^24 × 2^24 = 2^48 个 10ns = 32 天，远超任何录制。
+ *     ★ 仍必须【按数值读】(不能 view 成 u32)：F[18]*16777216 + F[41]。
+ *   ★ 水位不变：3 × 168 = 504 B ≤ HS 单包 512 B。
+ *   ★ 布局演进：v1=30f/120B；v2=33f/132B（加零偏）；v3=41f/164B（加 ESKF 持久状态）；
+ *     v4=42f/168B（时戳保精度）。仍遵循【尾部追加】，float[0..17] 与 [19..40] 的偏移不变。
+ *   ★ 全部原始输入都在帧内，PC 可逐帧重放。
+ *   ★ 布局演进：v1 = 30f/120B；v2 = 33f/132B（加零偏）；v3 = 41f/164B（加持久状态）。
+ *     一律【尾部追加】，float[0..29] 偏移与含义自始至终不变，
+ *     故解析端可用帧长（120/132/164）直接区分版本，老文件仍可读。
+ *   ★ 为什么必须报持久状态：acc_thr 与 P 编码了自开机以来的全部历史，
+ *     PC 侧拿一段截取数据做复刻时【无法反推】，实测导致 grav_open
+ *     8.2% vs 板载 53.6%、姿态发散 147°。有了本段即可把复刻初始化到同一起点。
+ *   ★ 为何不用独立"快照帧"：justfloat 按【定长帧】记账（s_frame_bytes），
+ *     同一时刻只使用一种帧，绝不混发——可变帧长会让上位机失效。
+ *     164B × 7673.5Hz = 1.26 MB/s，带宽足够，故逐帧上报。
+ *   ★ 水位不变：3 × 164 = 492 B ≤ HS 单包 512 B。 */
+#define JF_FULL_NFLOATS     42u
+#define JF_FULL_BYTES       (JF_FULL_NFLOATS * 4u)  /* 168 B */
+#define JF_FULL_WIRE_BYTES  168u
 
 /* 旧 DBG 帧定义（jf_dbg_push 保留不用，仅为编译兼容） */
 #define JF_DBG_NFLOATS     19u
@@ -109,10 +151,11 @@
  *   s_stage_n = 23 时会写到 st_stage[2208] —— 越界 192 B。
  *   24 × 92 = 2208 B 。 */
 #define JF_AGG_STAGE_BYTES   (JF_AGG_STAGE_FRAMES * JF_FULL_WIRE_BYTES)  /* 2880 B */
-/* ★ 水位 = 4 帧：块长 4×120 = 480 B < HS 单包 512 B，
+/* ★ 水位 = 3 帧：块长 3×132 = 396 B < HS 单包 512 B，
  *   每块恰好一个 bulk 包、无拆包开销。
- *   （帧长从 92 升到 120 后必须从 5 降到 4） */
-#define JF_AGG_FORCE_FRAMES  4u
+ *   （帧长 92→120 时从 5 降到 4；120→132 时必须再从 4 降到 3，
+ *     否则 4×132 = 528 B > 512 B，会被拆成两个包） */
+#define JF_AGG_FORCE_FRAMES  3u
 
 /* 兼容旧名 */
 #define JF_AGG_FRAMES      JF_AGG_FORCE_FRAMES
@@ -127,7 +170,13 @@ uint8_t jf_full_push(float qw, float qx, float qy, float qz,
                      float mag_resid, float acc_resid,
                      float mcur_x, float mcur_y, float mcur_z,
                      float mprev_x, float mprev_y, float mprev_z,
-                     float flag2);
+                     float flag2,
+                     float bias_x, float bias_y, float bias_z,
+                     float acc_thr,
+                     float pxx, float pyy, float pzz,
+                     float pxy, float pxz, float pyz,
+                     float calib_n,
+                     float ts_lo24);
 
 /* ★ QUAT 帧（仅四元数 24 B），保留 */
 

@@ -93,8 +93,9 @@ static uint8_t stage_frame(uint8_t *frame)
     return 1u;
 }
 
-/* ---------------- FULL 帧（全数据调试，92 B）----------------
- *  帧内包含 ESKF 实际用到的全部输入与输出，PC 可逐帧重放对比。 */
+/* ---------------- FULL 帧（全数据调试，132 B）----------------
+ *  帧内包含 ESKF 实际用到的全部输入与输出，PC 可逐帧重放对比。
+ *  v2：尾部追加 [30..32] = gyro_bias_dps[3]，前 30 个 float 偏移不变。 */
 uint8_t jf_full_push(float qw, float qx, float qy, float qz,
                      float gx, float gy, float gz,
                      float ax, float ay, float az,
@@ -103,7 +104,13 @@ uint8_t jf_full_push(float qw, float qx, float qy, float qz,
                      float mag_resid, float acc_resid,
                      float mcur_x, float mcur_y, float mcur_z,
                      float mprev_x, float mprev_y, float mprev_z,
-                     float flag2)
+                     float flag2,
+                     float bias_x, float bias_y, float bias_z,
+                     float acc_thr,
+                     float pxx, float pyy, float pzz,
+                     float pxy, float pxz, float pyz,
+                     float calib_n,
+                     float ts_lo24)
 {
     uint8_t buf[JF_FULL_WIRE_BYTES];
     uint32_t o;
@@ -123,6 +130,17 @@ uint8_t jf_full_push(float qw, float qx, float qy, float qz,
     o = put_f(buf, o, mcur_x);  o = put_f(buf, o, mcur_y);  o = put_f(buf, o, mcur_z);
     o = put_f(buf, o, mprev_x); o = put_f(buf, o, mprev_y); o = put_f(buf, o, mprev_z);
     o = put_f(buf, o, flag2);
+    /* v2：追踪器零偏（尾部追加，前 30 个 float 的偏移完全不变） */
+    o = put_f(buf, o, bias_x); o = put_f(buf, o, bias_y); o = put_f(buf, o, bias_z);
+    /* v3：ESKF 持久状态（PC 侧复刻初始化必需；纯历史量，无法从截取数据反推） */
+    o = put_f(buf, o, acc_thr);
+    o = put_f(buf, o, pxx); o = put_f(buf, o, pyy); o = put_f(buf, o, pzz);
+    o = put_f(buf, o, pxy); o = put_f(buf, o, pxz); o = put_f(buf, o, pyz);
+    o = put_f(buf, o, calib_n);
+    /* v4：时戳低 24 位。[18] 为高 24 位。
+     * 还原: ts = (u64)F[18]*16777216 + F[41]
+     * ★ 必须数值拆分、不可按位拷贝 —— 理由见 justfloat.h（同步字 = +Inf 陷阱）。 */
+    o = put_f(buf, o, ts_lo24);
     if (o != JF_FULL_WIRE_BYTES)
     {
         while (o < JF_FULL_WIRE_BYTES) buf[o++] = 0u;

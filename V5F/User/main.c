@@ -87,27 +87,26 @@ int main(void)
          * 这里让暂存区累积到 8 ms 才整块入队一次，把提交次数降到 <=125 次/s。 */
         jf_agg_poll();
 
-        /* ---- 保活（0.2 Hz；printf 逐字符忙等，本行 118 字符 @921600 = 1.28 ms）---- */
+        /* ---- 保活：★ 已删除 printf（2026-10-13）★ ----
+         *
+         * 原实现每 5.00 s 打一行 14 字段的长 printf。它【逐字符忙等】，
+         * 阻塞 V5F 主循环 ⟹ 发布路径整段停住。
+         *
+         * 实测证据（四份录制，跨固件版本复现）：
+         *   稳态段丢帧呈【完全周期】形态：每 5.00 s 恰好 17 帧
+         *     065442: 8.9(17帧) 13.9(17) 18.9(16) 23.9(17) 28.9(17)
+         *     072104: 8.7(17) 13.7(16) 18.7(16) 23.7(17) 28.7(17) 33.7(17) 38.7(17)
+         *   17 帧 × 130.25 us = 2.21 ms，与 921600 baud 下该行的忙等耗时吻合
+         *   （原注释按 118 字符估 1.28 ms，实际 14 个字段远超 118 字符）。
+         *   注：该行还带 14 个字段的 printf 格式化开销，同样是阻塞的。
+         *
+         * 后果：2.21 ms 的盲转，2000 dps 时 = 4.4°；而 ESKF 只能用 ω_last 外推
+         *   ⟹ 落在高速段就是一次姿态跳变（这正是"有时看得到弹跳、有时看不到"的来源）。
+         *
+         * 串口保活已无必要：链路存活由 CDC 帧率本身体现。
+         * 保留 t_next 计时以免引入未使用变量。 */
         if ((int64_t)(t_next - GetTime64_Us()) <= 0)
         {
-            printf("V5F,imu=%u,mmc=%u,bmp=%u,jf_drop=%u,agg_tx=%u,enq_fail=%u,ep_sent=%u,ep_busy=%u,ep_empty=%u,ep_kb=%u,pend=%u,skip=%u,start=%u,lag=%u,mrec=%u,mreinit=%u,mrc=%u\r\n",
-                   (unsigned)g_shm->imu.hdr.cnt,
-                   (unsigned)g_shm->mmc.hdr.cnt,
-                   (unsigned)g_shm->bmp.hdr.cnt,
-                   (unsigned)g_jf_drop,
-                   (unsigned)g_jf_agg_tx,
-                   (unsigned)g_jf_enq_fail,
-                   (unsigned)g_ep_sent,
-                   (unsigned)g_ep_busy,
-                   (unsigned)g_ep_empty,
-                   (unsigned)(g_ep_bytes / 1024u),
-                   (unsigned)jf_agg_pending(),
-                   (unsigned)skip_cnt,
-                   (unsigned)g_shm->imu_start_cnt,
-                   (unsigned)(g_shm->imu_start_cnt - g_shm->imu.hdr.cnt),
-                   (unsigned)g_shm->mmc_recover_cnt,    /* 第 1 级：清锁存救回次数 */
-                   (unsigned)g_shm->mmc_reinit_cnt,     /* 第 2 级：软件复位次数   */
-                   (unsigned)g_shm->mmc_last_reinit_rc);/* 最近 init 返回码       */
             t_next = GetTime64_Us() + 5000000ULL;
         }
 
@@ -171,15 +170,32 @@ int main(void)
                 (void)att_div;
                 {
                     float f = 0.0f, f2 = 0.0f;
+                    float psym[6];      /* P 的 6 个独立分量（v3 持久状态上报） */
+                    float ts_hi24, ts_lo24;   /* v4：u64 时戳按 2^24 数值拆分 */
+                    proc_eskf_p_sym(psym);
+                    /* ★ 时戳编码：必须【数值拆分在 2^24】，不可按位拷贝。
+                     *   justfloat 同步字 00 00 80 7F = float 0x7F800000 = +Inf；
+                     *   按位拷贝会让该字段遍历全部 u32 ⟹ 必然命中同步字(每 42.9s 一次)
+                     *   ⟹ 上位机错位/卡死。拆在 2^24 则两段都是 < 2^24 的有限整数，
+                     *   精确可表示且位型永远到不了 +Inf/NaN。
+                     *   还原: ts = (u64)F[18]*16777216ULL + (u64)F[41]  (32 天不溢出) */
+                    ts_hi24 = (float)((ts >> 24) & 0xFFFFFFu);
+                    ts_lo24 = (float)(ts & 0xFFFFFFu);
                     if (g_proc.mag_valid != 0u)          f += 1.0f;
                     if (proc_mag_is_new() != 0u)         f += 2.0f;
                     if (proc_eskf_grav_open() != 0u)     f += 4.0f;
                     if (proc_eskf_ready() != 0u)         f += 8.0f;
+                    if (g_proc.bias_ok != 0u)            f += 16.0f;  /* bit4 零偏已收敛 */
+                    if (proc_eskf_valid() != 0u)         f += 32.0f;  /* bit5 参考系有效 */
+                    if (proc_eskf_calibrating() != 0u)   f += 64.0f;  /* bit6 启动标定中 */
 
                     if (pol_cur != 0u)                   f2 += 1.0f;
                     if (pol_prev != 0u)                  f2 += 2.0f;
                     if (mmc_prev_valid != 0u)            f2 += 4.0f;
                     if (proc_eskf_ready() != 0u)         f2 += 8.0f;
+                    f2 += 16.0f;         /* bit4 = 含 [30..32] 零偏字段 */
+                    f2 += 32.0f;         /* bit5 = 含 [33..40] ESKF 持久状态 */
+                    f2 += 64.0f;         /* bit6 = layout_v4（[18]=ts>>24, [41]=ts&0xFFFFFF） */
 
                     (void)jf_full_push(g_proc.q[0], g_proc.q[1],
                                        g_proc.q[2], g_proc.q[3],
@@ -189,14 +205,20 @@ int main(void)
                                        (float)g_shm->imu.az * ACCEL_G_PER_LSB,
                                        g_proc.mag_u[0], g_proc.mag_u[1], g_proc.mag_u[2],
                                        f,
-                                       (float)((double)ts * 1e-1),
+                                       ts_hi24,
                                        (float)(g_shm->imu.hdr.cnt & 0x00FFFFFFu),
                                        (float)(g_shm->mmc.hdr.cnt & 0x00FFFFFFu),
                                        proc_eskf_mag_resid(),
                                        proc_eskf_acc_resid(),
                                        (float)m_cur_raw[0], (float)m_cur_raw[1], (float)m_cur_raw[2],
                                        (float)m_prev_raw[0], (float)m_prev_raw[1], (float)m_prev_raw[2],
-                                       f2);
+                                       f2,
+                                       g_proc.bias_dps[0], g_proc.bias_dps[1], g_proc.bias_dps[2],
+                                       proc_eskf_acc_thr(),
+                                       psym[0], psym[1], psym[2],
+                                       psym[3], psym[4], psym[5],
+                                       proc_eskf_calib_n(),
+                                       ts_lo24);
                 }
                 (void)mx; (void)my; (void)mz; (void)mpol;
             }

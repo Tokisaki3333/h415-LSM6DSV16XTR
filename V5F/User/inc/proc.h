@@ -95,6 +95,11 @@ uint8_t proc_eskf_ready(void);
 uint8_t proc_eskf_calib_done(void);
 uint8_t proc_eskf_valid(void);
 uint8_t proc_eskf_grav_open(void);
+/* ★ 持久状态上报（PC 侧复刻初始化必需，见 proc_eskf.c 注释） */
+float   proc_eskf_acc_thr(void);          /* 自适应重力残差门限 */
+float   proc_eskf_calib_n(void);          /* 启动标定累计样本数 */
+void    proc_eskf_p_sym(float *out6);     /* P 的 6 个独立分量 */
+uint8_t proc_eskf_calibrating(void);
 float   proc_eskf_mag_resid(void);
 float   proc_eskf_acc_resid(void);
 float   proc_eskf_mag_corr(void);

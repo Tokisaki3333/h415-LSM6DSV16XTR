@@ -679,7 +679,17 @@ void EXTI15_8_IRQHandler(void)
         g_imu_drdy_ts = GetTime64_10Ns();
         g_imu_isr_cnt++;
         if (g_shm != 0)
+        {
             g_shm->imu_start_cnt = g_imu_isr_cnt;   /* 供 V5F 对比丢帧 */
+            /* ★★ 把 DRDY 时刻经【共享内存】交给 V5F（2026-10-13）。
+             * 跨核唯一通道就是共享内存：本 ISR 里写的 g_imu_drdy_ts 属于 V3F 镜像，
+             * V5F 直接引用只会读到它自己的初值 0 ⟹ 发布时戳恒 0 ⟹
+             * proc_chain 的 dt_s=0 ⟹ 提前 return ⟹ ESKF 从未被调用
+             * ⟹ calib_n≡0/ready≡0/四元数停在 [1,0,0,0]。
+             * 复用 chan_hdr_t 的 hi/lo + 屏障协议，解决 64 位跨核读取原子性。 */
+            shm_chan_ts_write(&g_shm->imu_drdy, g_imu_drdy_ts);
+            g_shm->imu_drdy.cnt++;
+        }
         BOARD_IMU_DrdyStart();                      /* 拉低 CS + 启动 TX DMA */
         g_exti_irq_cnt++;
     }

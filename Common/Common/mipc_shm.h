@@ -174,6 +174,21 @@ typedef struct {
     gps_gsv_chan_t    gps_gsv;
     /* OLED 显存：128×64/8 = 1024 B，页主序 8 页 × 128 列；双核可读写，aligned(4) 便于双核/DMA 访问 */
     volatile uint8_t  oled_fb[1024] __attribute__((aligned(4)));
+    /* ★★ 末尾追加（2026-10-13）——绝不可插到中间！
+     *   插在中间会让 log/imu/mmc/bmp/全部 GPS 通道/oled_fb 的偏移整体平移，
+     *   两个核若非同时重建就全面错位。追加在末尾则既有偏移一字不动。
+     *
+     * 陀螺 DRDY 时刻：V3F 在 DRDY 中断里写、V5F 在 DMA 完成中断里读。
+     *   为什么必须走共享内存：board_io.c 在 Common/Common，V3F 与 V5F 【各编译一份】
+     *   ⟹ 全局变量互不相通。g_imu_drdy_ts 属于 V3F 镜像，V5F 直接引用只会读到自己
+     *   那份的初值 0 —— 实测后果：发布时戳恒 0 ⟹ proc_chain 的 dt_s=0 ⟹ 提前 return
+     *   ⟹ proc_eskf_step 从未被调用 ⟹ calib_n≡0 / ready≡0 / calibrating≡100%
+     *   ⟹ 四元数停在初值 [1,0,0,0]（rec_20261013_071815 实测完全如此）。
+     *   复用 chan_hdr_t：其 write/read 已用"hi 先写、屏障、lo 后写 + cnt 作发布标记"
+     *   的协议解决 64 位跨核读取原子性，不要自己造。
+     * V5F 在 DMA 完成中断【入口处】读，使与数据帧的配对窗口最小。 */
+    chan_hdr_t        imu_drdy;
+    chan_hdr_t        mmc_drdy;         /* 地磁 DRDY 时刻（供 V5F 对齐用） */
 } shared_mem_t;
 
 /* 共享区指针：V3F 定义 storage 并由 g_shm 指向（地址经 IPC_MSG0 传给 V5F）；V5F 同样以 g_shm 命名 */

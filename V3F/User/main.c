@@ -199,7 +199,7 @@ int main(void)
         vg.GPIO_Speed = GPIO_Speed_High;
         GPIO_Init(GPIOA, &vg);
 
-        GPIO_SetBits(GPIOA, GPIO_Pin_5);        /* 1V2 最低 */
+        GPIO_ResetBits(GPIOA, GPIO_Pin_5);        /* 1V2 最高 */
     }
 
     /*------------------------------------------------------------------

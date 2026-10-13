@@ -122,9 +122,9 @@ void proc_chain_step(const volatile shared_mem_t *shm)
         g_proc.gyro_lsb[0] = (float)shm->imu.gx;
         g_proc.gyro_lsb[1] = (float)shm->imu.gy;
         g_proc.gyro_lsb[2] = (float)shm->imu.gz;
-        g_proc.gyro_dps[0] = g_proc.gyro_lsb[0] * GYRO_DPS_PER_LSB;
-        g_proc.gyro_dps[1] = g_proc.gyro_lsb[1] * GYRO_DPS_PER_LSB;
-        g_proc.gyro_dps[2] = g_proc.gyro_lsb[2] * GYRO_DPS_PER_LSB;
+        g_proc.gyro_dps[0] = g_proc.gyro_lsb[0] * GYRO_DPS_PER_LSB_X;
+        g_proc.gyro_dps[1] = g_proc.gyro_lsb[1] * GYRO_DPS_PER_LSB_Y;
+        g_proc.gyro_dps[2] = g_proc.gyro_lsb[2] * GYRO_DPS_PER_LSB_Z;
         return;
     }
 
@@ -150,9 +150,9 @@ void proc_chain_step(const volatile shared_mem_t *shm)
         g_proc.gyro_lsb[0] = (float)shm->imu.gx;
         g_proc.gyro_lsb[1] = (float)shm->imu.gy;
         g_proc.gyro_lsb[2] = (float)shm->imu.gz;
-        g_proc.gyro_dps[0] = g_proc.gyro_lsb[0] * GYRO_DPS_PER_LSB;
-        g_proc.gyro_dps[1] = g_proc.gyro_lsb[1] * GYRO_DPS_PER_LSB;
-        g_proc.gyro_dps[2] = g_proc.gyro_lsb[2] * GYRO_DPS_PER_LSB;
+        g_proc.gyro_dps[0] = g_proc.gyro_lsb[0] * GYRO_DPS_PER_LSB_X;
+        g_proc.gyro_dps[1] = g_proc.gyro_lsb[1] * GYRO_DPS_PER_LSB_Y;
+        g_proc.gyro_dps[2] = g_proc.gyro_lsb[2] * GYRO_DPS_PER_LSB_Z;
         return;
     }
 
@@ -170,9 +170,9 @@ void proc_chain_step(const volatile shared_mem_t *shm)
         av[2] = (float)shm->imu.az * ACCEL_G_PER_LSB;
         proc_attitude_align(av);
         if (g_proc.q_valid != 0u) s_aligned = 1u;
-        g_proc.gyro_dps[0] = g_proc.gyro_lsb[0] * GYRO_DPS_PER_LSB;
-        g_proc.gyro_dps[1] = g_proc.gyro_lsb[1] * GYRO_DPS_PER_LSB;
-        g_proc.gyro_dps[2] = g_proc.gyro_lsb[2] * GYRO_DPS_PER_LSB;
+        g_proc.gyro_dps[0] = g_proc.gyro_lsb[0] * GYRO_DPS_PER_LSB_X;
+        g_proc.gyro_dps[1] = g_proc.gyro_lsb[1] * GYRO_DPS_PER_LSB_Y;
+        g_proc.gyro_dps[2] = g_proc.gyro_lsb[2] * GYRO_DPS_PER_LSB_Z;
         return;
     }
 
@@ -215,6 +215,9 @@ void proc_chain_step(const volatile shared_mem_t *shm)
             proc_eskf_get_q(qq);
             g_proc.q[0] = qq[0]; g_proc.q[1] = qq[1];
             g_proc.q[2] = qq[2]; g_proc.q[3] = qq[3];
+#ifdef PC_PROBE
+            PC_PROBE_SNAP(g_pc_q_eskf);
+#endif
             g_proc.q_valid = 1u;
             g_proc.grav_err_deg = 0.0f;
             g_proc.grav_applied = proc_eskf_grav_open();   /* 本帧重力倾斜修正是否施加 */
@@ -228,7 +231,22 @@ void proc_chain_step(const volatile shared_mem_t *shm)
      * ★ ESKF 接管后【让行】：两者都改 q 会重复注入同一观测量。
      *   仅在 ESKF 尚未接管时（启动标定窗口内 / 标定无效）作为兜底。 */
     if (proc_eskf_ready() == 0u)
-        proc_mag_corr_step(shm, dt_s);
+#ifdef PC_PROBE
+        PC_PROBE_SNAP(g_pc_q_pre);
+#endif
+        /* ★★ 门控（2026-10-13）：地磁修正【必须在 mag_valid 且参考系有效时】才允许动 q。
+         * 原写法无条件调用 ⟹ 在 mag_valid ≡ 0（proc_mag.c 不算 mag_u、mag_u 全零）
+         * 的情况下仍在运行，且其"两个互斥入口(A/B) + 重力失效累加器"设计本身
+         * 含离散切换 ⟹ 实测沿【偏航】单帧跳变 0.5~2.2°（rec_20261013_062144：
+         * t=2.705/12.575/12.636/31.127/31.198 s，Δcnt=1、dt_s 正常 131µs、
+         * grav_open=0、|w|=0.5~2 dps），三项独立证据均把 ESKF 预测与重力更新排除。
+         * 这正是"地磁引入巨大误差导致重力链被拖坏"的现场。 */
+        if ((g_proc.mag_valid != 0u) && (proc_eskf_valid() != 0u)) {
+            proc_mag_corr_step(shm, dt_s);
+        }
+#ifdef PC_PROBE
+        PC_PROBE_SNAP(g_pc_q_post);
+#endif
 
     /* ★ EKF 迭代计时终点（10 ns 计数） */
     {

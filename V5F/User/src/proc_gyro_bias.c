@@ -142,8 +142,8 @@ uint8_t proc_gyro_bias_step(void)
     /* 输出：校正后 counts + 零偏估计（dps） */
     for (i = 0u; i < 3u; i++)
     {
-        g_proc.gyro_dps[i] = (g_proc.gyro_lsb[i] - s_bias[i]) * GYRO_DPS_PER_LSB;
-        g_proc.bias_dps[i] = s_bias[i] * GYRO_DPS_PER_LSB;
+        g_proc.gyro_dps[i] = (g_proc.gyro_lsb[i] - s_bias[i]) * gyro_dps_per_lsb((int)i);
+        g_proc.bias_dps[i] = s_bias[i] * gyro_dps_per_lsb((int)i);
     }
     g_proc.bias_ok = s_boot_done;
 
@@ -151,3 +151,15 @@ uint8_t proc_gyro_bias_step(void)
     s_prev_static = is_static;
     return 0u;
 }
+
+
+#ifdef PC_PROBE
+/* ★ PC 侧注入（2026-10-13）: 从录制帧的 bias_dps 还原 s_bias(LSB), 使复刻与板载同起点。
+ * 不注入则追踪器从 GB_BIAS0_LSB=(-5,-2,+3) 重新收敛 ⟹ 复刻的 gyro_dps 与板载不同
+ * ⟹ 姿态从第一帧就偏（实测 resid 1.147° vs 板载 0.161°），后续全部结论作废。 */
+void proc_gyro_bias_pc_inject(const float *bias_lsb)
+{
+    int i;
+    for (i = 0; i < 3; i++) s_bias[i] = bias_lsb[i];
+}
+#endif
