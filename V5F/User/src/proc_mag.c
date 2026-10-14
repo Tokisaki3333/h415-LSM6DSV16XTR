@@ -26,6 +26,7 @@
 #include "proc.h"
 #include "proc_tune.h"
 #include "mipc_shm.h"
+#include <math.h>       /* sqrtf：产出净场模长用（与 proc_eskf.c 等一致） */
 
 #ifdef PC_PROBE
 /* PC 侧探针（上报列，不参与算法）：由 pc_chain_main.c 读取 */
@@ -93,7 +94,6 @@ uint8_t proc_mag_step(const volatile shared_mem_t *shm)
     int32_t  cur[3];
     uint32_t cnt;
     uint8_t  pol;
-    float    sgn;
     uint32_t i;
 
     s_new_mag = 0u;
