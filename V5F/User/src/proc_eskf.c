@@ -41,6 +41,8 @@
 
 #define ESKF_DEG2RAD    0.0174532925f
 #define ESKF_RAD2DEG    57.29577951f
+/* ★ 构建版本标识（每次改动本文件必须同步更新，供"输出即证明版本"使用） */
+#define ESKF_BUILD_VER  "ESKF-20261014-0715-nograv-3deg20s"
 
 /* ---------------- 参数 ---------------- */
 /* ★★ 重力牵引总开关 ★★
@@ -66,7 +68,7 @@
  * 在正确的 ARW 之下，运动时(|ω|=2000dps) k_s 项占 Q 的 98% ⟹ 它才是运动期 P 的主驱动。
  * 若沿用旧的 0.0038，k_s 项只占 1/225，加了等于没加。 */
 #define ESKF_SIG_G          3.6943e-05f
-#define ESKF_KS_SCALE       636e-6f
+#define ESKF_KS_SCALE       7.5e-5f
 /* 地磁观测噪声（度）：各向异性。沿 h 方向本身不可观测，用大方差使其自动失效 */
 #define ESKF_MAG_PERP_DEG   0.44f
 #define ESKF_MAG_PAR_DEG    4.00f
@@ -138,8 +140,10 @@ typedef struct {
     /* 导航系参考矢量（启动窗口实测，无任何矩阵转换）*/
     float   v_up[3];
     float   v_mag[3];
-    float   acc_thr;            /* 自适应残差门当前值 */
+    float   acc_thr;            /* 自适应残差门当前值（已废弃，仅留上报） */
     uint8_t grav_open;          /* 本帧重力观测是否施加 */
+    float   nograv_s;           /* ★ 重力观测连续不可用的时长（s），用于无重力期 P 膨胀 */
+    uint8_t grav_last;          /* ★ 上一帧 grav_open（预测步在重力门之前 ⟹ 只能看上帧） */
     uint8_t calibrating;
     uint8_t ready;
     uint8_t valid;
@@ -264,8 +268,88 @@ static void q_body_rotate(float *q, const float *v)
 extern float g_pc_nis, g_pc_applied, g_pc_throt_set;
 extern float g_pc_p_pre[3], g_pc_p_post[3];
 extern float g_pc_p6pre[6], g_pc_p6post[6];
+extern float g_pc_wigg;
 #endif
-static float eskf_update(const float *v_nav, const float *z, float r_perp, float r_par)
+/* ★★ IGG-III 三段鲁棒权常数（2026-10-13 重建）
+ * 作用: d = rᵀS⁻¹r 落在 [K0,K1] 时按 (K0/rd)·tt² 降权，≥K1 时压到 WMIN（地板，不硬拒）。
+ * 用法: 【重力】use_igg=1 启用；【地磁】use_igg=0 ⟹ w ≡ 1.0（地磁不用 IGG，
+ *       依据: 2026-10-14 用户指示 + 实测"地磁 IGG 会把大新息判粗差压到 WMIN 而自锁"）。 */
+#ifndef ESKF_IGG_K0
+#define ESKF_IGG_K0     1.0f
+#endif
+#ifndef ESKF_IGG_K1
+#define ESKF_IGG_K1     3.0f
+#endif
+#ifndef ESKF_IGG_WMIN
+#define ESKF_IGG_WMIN   1.0e-3f
+#endif
+/* ★★ 强制恢复（recovery trigger）常数
+ *   REJ_WTHR : 判为"被拒"的权阈（≤ 它则计数 +1）
+ *   REJ_MAX  : 连续被拒帧数上限，超过则强制 w=1 放行一次
+ *   取值依据：门开帧 7670 Hz 下 0.25 s ≈ 1900 帧 ⟹ 误判到恢复的时延 ~0.25 s，
+ *   而"粗差是瞬态的"（实测中位 2~3 帧）⟹ 不会把真实粗差放进来。 */
+#ifndef ESKF_REJ_WTHR
+#define ESKF_REJ_WTHR   0.1f
+#endif
+#ifndef ESKF_REJ_MAX
+#define ESKF_REJ_MAX    1900u
+#endif
+static uint16_t s_rej_cnt = 0u;
+/* ★★ 无重力观测段（|ω| 大 / 加计不可信）倾斜 1σ 的增长率（rad/√s）。
+ *   依据 docs/IGG-III稳健权设计记录.md §1：σ_tilt = ESKF_SIG_NOGRAV · t_nograv。
+ *   ★ 取值以【原代码产物实测】为准（目标：与原来相同），两步定出：
+ *     ① 反编译 x_025232_on.bin 最长无重力段（17.69 s, 帧 38455..174211）:
+ *          P6pre 迹 3.8353e-07 → 6.7836e-04 ⟹ 该段增长 dP = 6.7797e-04 rad²
+ *     ② 在本地构建同段量出 Σ t_nograv·dt = 47.8636（由 ΔP=2N²Σt·dt 反解）
+ *        ⟹ N = √(dP / (2Σ)) = 2.6613e-03 rad/√s
+ *   接力文档 §1.2 记的 2.384e-3 与之相差 12%，属同一量级（可能口径略异）。 */
+#ifndef ESKF_SIG_NOGRAV
+#define ESKF_SIG_NOGRAV     2.6180e-3f
+#endif
+/* ★★ 无重力期累积器（依据归档设计的 v2 模型，逐帧严格二选一）：
+ *     门关 / 重力不可用 :  acc <- acc + GROW              （GROW = 1e-6，与 dt 无关）
+ *     门开且牵引成功    :  acc <- max(ACC_MIN, acc*DECAY) （DECAY = 0.9995，ACC_MIN = 0.02）
+ *   ★ 地板 ACC_MIN = 0.02 是关键：门抖动时 acc 贴着地板缓慢摆动，
+ *     而【不会】被清零 —— 这正是"用比例衰减代替清零"的本意。
+ *   注入映射：σ_tilt = ESKF_SIG_NOGRAV · sqrt(acc/ACC_MIN)（acc = ACC_MIN 时恰为 SIG_NOGRAV），
+ *     门关期间每步把 ΔP = σ_tilt² = SIG_NOGRAV² · acc/ACC_MIN 加到倾斜对角。 */
+static float s_last_w = 1.0f, s_last_nis = 0.0f;
+
+/* ★★ PC 侧探针全局量（10-14 pc_chain_main.c 需要）
+ * 说明：这些量【只用于 PC 复刻的上报列】，不参与任何算法判断。
+ * g_pc_mv / g_pc_mn / g_pc_mr / g_pc_caln / g_pc_calmag 定义在 proc_mag.c；
+ * 以 g_pc_q_ 开头的、以及 stage / upd、mvcall / mncall 由 pc_chain_main.c 定义。 */
+#ifdef PC_PROBE
+float g_pc_wigg = 1.0f;
+float g_pc_nograv = 0.0f;
+float g_pc_gate_an = 0.0f, g_pc_gate_avn = 0.0f, g_pc_gate_res = 0.0f;
+float g_pc_ready = 0.0f, g_pc_calmag2 = 0.0f, g_pc_valid2 = 0.0f;
+float g_pc_mres = 0.0f, g_pc_mux = 0.0f, g_pc_muy = 0.0f, g_pc_muz = 0.0f;
+float g_pc_vmx = 0.0f, g_pc_vmy = 0.0f, g_pc_vmz = 0.0f, g_pc_mrok = 0.0f;
+float g_pc_probe_unorm = 0.0f, g_pc_probe_nmag = 0.0f, g_pc_probe_anmean = 0.0f;
+/* v_mag 重建累加器（仅 PC 注入路径使用） */
+static float s_vmag_acc[3] = {0.0f, 0.0f, 0.0f};
+static float s_vmag_aacc[3] = {0.0f, 0.0f, 0.0f};   /* 静止窗内加计累加（供 eskf_build_q0） */
+static uint16_t s_vmag_cnt = 0u;
+static uint8_t s_vmag_ready = 0u;
+#ifndef ESKF_VMAG_NWIN
+#define ESKF_VMAG_NWIN  1000u     /* 累加窗：1000 个磁样本 ≈ 0.83 s */
+#endif
+const char *g_pc_eskf_ver = ESKF_BUILD_VER;
+#endif
+float proc_eskf_grav_w(void)   { return s_last_w; }
+float proc_eskf_grav_nis(void) { return s_last_nis; }
+void proc_eskf_pc_set_vmag(const float *v3)
+{
+    float n;
+    uint8_t a;
+    for (a = 0; a < 3u; a++) s_eskf.v_mag[a] = v3[a];
+    n = sqrtf(s_eskf.v_mag[0]*s_eskf.v_mag[0] + s_eskf.v_mag[1]*s_eskf.v_mag[1]
+            + s_eskf.v_mag[2]*s_eskf.v_mag[2]);
+    if (n > 1e-9f) { for (a = 0; a < 3u; a++) s_eskf.v_mag[a] /= n; }
+}
+static float eskf_update(const float *v_nav, const float *z, float r_perp, float r_par,
+                         uint8_t use_igg)
 {
     float h[3], r[3], H[3][3], PHt[3][3], S[3][3], Si[3][3], K[3][3];
     float KH[3][3], Pn[3][3], dx[3];
@@ -304,9 +388,12 @@ static float eskf_update(const float *v_nav, const float *z, float r_perp, float
             S[i][j] += r_perp * eye + r_par * (d - eye);
         }
     if (mat3_inv(&S[0][0], &Si[0][0]) == 0u) return 0.0f;
-    /* ★★ NIS 门（2026-10-13）: NIS = r^T S^-1 r, S = H P H^T + R 随 P 自适应。
-     * 超 chi2(2 DOF,95%%)=5.991 则本帧不施加修正, 返回 -1 让调用方把 grav_open 置 0。
-     * 放在求逆之后、算 K 之前 ⟹ 拒绝时完全不改 q/P。 */
+    /* ★★ NIS（2026-10-14 重建）: 只【计算并上报】，不再作为生死门。
+     *   原写法 `if (nis > ESKF_GRAV_NIS_MAX) return -1` 会造成：
+     *     P 被压到 ≈R 量级后 NIS = resid²/(P⊥h+R) 极严 ⟹ 每帧拒绝 ⟹ 永久锁死
+     *     （实测 rec_20261013_082033 留下 3° 平台）。
+     *   拦截运动污染帧的职责已由【速率门(20 dps) + 模长门(0.05g)】承担。
+     *   保留 nis 供上报（col24）与 IGG 降权使用，不返回 -1。 */
     {
         float nis = 0.0f;
         for (i = 0; i < 3u; i++) {
@@ -317,11 +404,83 @@ static float eskf_update(const float *v_nav, const float *z, float r_perp, float
 #ifdef PC_PROBE
         g_pc_nis = nis;
 #endif
-#ifdef PC_PROBE
-        if (!(nis <= ESKF_GRAV_NIS_MAX)) { g_pc_applied = -1.0f; return -1.0f; }
+        s_last_nis = nis;                       /* ★ 上报用: d = rᵀ S⁻¹ r */
+        {
+            /* ★★ IGG-III 三段权（2026-10-13 重建；2026-10-14 加 use_igg 开关）
+             *   rd = sqrt(nis/2)（χ²(2) 自由度归一）
+             *   rd < K0        ⟹ w = 1
+             *   K0 ≤ rd < K1   ⟹ w = (K0/rd)·((K1-rd)/(K1-K0))²
+             *   rd ≥ K1        ⟹ w = WMIN（地板，永不归零 ⟹ 不会自锁）
+             *   use_igg==0（地磁）⟹ w ≡ 1.0
+             * K ← w·K（缩放 PHt 即缩放 K）⟹ 估计与协方差同步受限，一致性不破。 */
+            float rd = sqrtf((nis > 0.0f ? nis : 0.0f) * 0.5f);
+            float w;
+#if defined(ESKF_IGG_OFF)
+            /* 实验臂 A：完全不用 IGG（只靠门控拦污染）⟹ w ≡ 1 */
+            w = 1.0f;
+#elif defined(ESKF_IGG_SOFT)
+            /* 实验臂 B：放宽 IGG —— 内点域 ×3、地板 0.001 → 0.3 */
+            if (use_igg == 0u) {
+                w = 1.0f;
+            } else if (rd < ESKF_IGG_K0 * 3.0f) {
+                w = 1.0f;
+            } else if (rd < ESKF_IGG_K1 * 3.0f) {
+                float k0 = ESKF_IGG_K0 * 3.0f, k1 = ESKF_IGG_K1 * 3.0f;
+                float tt = (k1 - rd) / (k1 - k0);
+                w = (k0 / (rd > 1e-6f ? rd : 1e-6f)) * tt * tt;
+                if (w < 0.3f) w = 0.3f;
+            } else {
+                w = 0.3f;
+            }
 #else
-        if (!(nis <= ESKF_GRAV_NIS_MAX)) return -1.0f;
+            /* 基准臂：原 IGG-III 三段权（K0=1, K1=3, WMIN=1e-3） */
+            if (use_igg == 0u) {
+                w = 1.0f;
+            } else if (rd < ESKF_IGG_K0) {
+                w = 1.0f;
+            } else if (rd < ESKF_IGG_K1) {
+                float tt = (ESKF_IGG_K1 - rd) / (ESKF_IGG_K1 - ESKF_IGG_K0);
+                w = (ESKF_IGG_K0 / (rd > 1e-6f ? rd : 1e-6f)) * tt * tt;
+            } else {
+                w = ESKF_IGG_WMIN;
+            }
 #endif
+            if (!(w >= ESKF_IGG_WMIN)) w = ESKF_IGG_WMIN;
+            /* ★★ 强制恢复（recovery trigger，2026-10-14）
+             * 问题：IGG 的 w=WMIN 把【真实的大误差】与【粗差】当同一类。
+             *   实测 rec_20261014_000422：重力门只开 0.04%，门开时 acc_resid 中位
+             *   55.84°，落 WMIN 后永不再修 ⟹ 与文档 §L19/L144 描述的自锁同构。
+             *   数学上无法靠膨胀 P 解决：要 rd≤3 需 P≥r²/9=(0.97rad)²/9=0.104 rad²
+             *   （σ_tilt=18.5°）⟹ 那已不是滤波。
+             * 判据：连续被降权的帧数超阈 ⟹ "重力一直在坚持同一个说法" ⟹ 错的是滤波器
+             *   ⟹ 强制按全权接受一次。用【泄漏计数器】防逐帧抖动误触。
+             *   w ≤ REJ_WTHR ⟹ cnt++；否则 cnt--（下限 0）。
+             *   cnt > REJ_MAX ⟹ w 强制 1，并把 cnt 清零（重新计时）。
+             * 只在门开帧可能触发（门关时本函数不被调用）⟹ 纯平动/剧烈运动"门本就关"
+             *   的情况不会误触发；只有"门开着却一直不接受"才触发。
+             * 设计依据：reference_implementations_survey.md 记的 Fusion recoveryTrigger
+             *   （"连续被拒 +1、通过 −9，超过 rejectionTimeout 就强制放行一次"）。 */
+            if (use_igg != 0u) {
+                if (w <= ESKF_REJ_WTHR) {
+                    if (s_rej_cnt < 0xFFFFu) s_rej_cnt++;
+                } else if (s_rej_cnt > 0u) {
+                    s_rej_cnt--;
+                }
+                if (s_rej_cnt > ESKF_REJ_MAX) {
+                    w = 1.0f;            /* 强制放行 */
+                    s_rej_cnt = 0u;
+                }
+            }
+            if (w < 1.0f) {
+                for (i = 0; i < 3u; i++)
+                    for (j = 0; j < 3u; j++) PHt[i][j] *= w;
+            }
+            /* ★ s_last_w 必须在 #ifdef 之外 —— MCU 侧也要更新，否则上报恒为初值 1.0 */
+            s_last_w = w;
+#ifdef PC_PROBE
+            g_pc_wigg = w;
+#endif
+        }
     }
 
     for (i = 0; i < 3u; i++)
@@ -345,7 +504,12 @@ static float eskf_update(const float *v_nav, const float *z, float r_perp, float
      * 正解：按比例缩放整个增益 K，使估计与协方差【同步】受限。 */
     {
         float n2 = dx[0]*dx[0] + dx[1]*dx[1] + dx[2]*dx[2];
-        if (n2 > ESKF_GRAV_DX_MAX_RAD * ESKF_GRAV_DX_MAX_RAD) {
+        /* ★★ 限幅只作用于【重力】通道（2026-10-14 用户要求）
+         *   原始 0.5° 限幅是为重力设的（拦加计被线加速度污染的帧）。
+         *   磁通道由用户明确要求【无限幅】—— 磁不存在"被运动污染"的同构问题，
+         *   且限幅会让磁的大错位以 0.5°/帧 缓慢爬行（实测 54° 要 108 帧）。
+         *   用 use_igg==0 作为"磁通道"标记（磁恒为 0，重力恒为 1）。 */
+        if ((use_igg != 0u) && (n2 > ESKF_GRAV_DX_MAX_RAD * ESKF_GRAV_DX_MAX_RAD)) {
             float sc = ESKF_GRAV_DX_MAX_RAD / sqrtf(n2);
             for (i = 0; i < 3u; i++)
                 for (j = 0; j < 3u; j++) K[i][j] *= sc;
@@ -413,8 +577,7 @@ static float eskf_update(const float *v_nav, const float *z, float r_perp, float
  *   q0 = R0 转四元数 ； v_mag = R0 · u_mean
  * ★ 不得改成 q0=identity：PC 实测两者姿态差恒定 179.63°。 */
 static uint8_t eskf_build_q0(const float *a_mean, const float *u_mean)
-{
-    float zb[3], yb[3], xb[3], R0[9], um[3];
+{    float zb[3], yb[3], xb[3], R0[9], um[3];
     float na, nu, dp, ny, tr, w0, sn;
     uint8_t i;
 
@@ -543,6 +706,8 @@ static void eskf_calib_reset(void)
     s_cal_n_mag  = 0u;
     s_eskf.acc_thr = ESKF_ACC0_RAD;
     s_eskf.grav_open = 0u;
+    s_eskf.nograv_s = 0.0f;         /* ★ 无重力期计时（P 膨胀用） */
+    s_eskf.grav_last = 0u;
 }
 
 void proc_eskf_init(void)
@@ -605,6 +770,23 @@ void proc_eskf_pc_inject(const float *q4, const float *P6, float acc_thr, float 
     s_eskf.ready = 1u; s_eskf.valid = 1u; s_eskf.calibrating = 0u;
     s_eskf.n = 15000u;
     g_pc_throt_set = throt;
+    /* ★★ 导航系磁场参考 v_mag 的数学等效重建（2026-10-14）
+     * 问题：注入旁路了启动标定 ⟹ eskf_build_q0 从不执行 ⟹
+     *       v_mag 停在初值 [0,1,0]（水平任意方向）、mag_ref_ok=0。
+     *       于是磁观测拿【水平假参考】去拉姿态，把航向拉到错处
+     *       （实测 mag_resid 56.4°、姿态歪 54°）。
+     * 正解（与 eskf_build_q0 数学等价，只是数据来源改为实测）：
+     *       v_mag = normalize( Σ_i R(q_i)·z_i )
+     *   其中 z_i = 实测机体系磁场单位矢量（proc_mag 的 mag_u），
+     *   R(q_i) = 由注入姿态定义的 体→导航 旋转。
+     *   物理含义：把上电以来的实测机体系磁场，按当时的姿态转到导航系；
+     *   姿态正确时它们应重合，其均值即导航系磁场方向（含真实倾角）。
+     * 实现：开启累加窗，在磁观测分支里累加 R(q)·z；窗满后归一赋给 v_mag。 */
+    s_vmag_acc[0] = s_vmag_acc[1] = s_vmag_acc[2] = 0.0f;
+    s_vmag_aacc[0] = s_vmag_aacc[1] = s_vmag_aacc[2] = 0.0f;
+    s_vmag_cnt = 0u;
+    s_vmag_ready = 0u;
+    s_eskf.mag_ref_ok = 0u;
 }
 #endif
 void proc_eskf_get_q(float *q_out)
@@ -713,6 +895,11 @@ void proc_eskf_step(float dt_s, const float *gyro_dps, const float *gyro_lsb,
             }
             an_mean = sqrtf(a_mean[0]*a_mean[0] + a_mean[1]*a_mean[1] + a_mean[2]*a_mean[2]);
             unorm   = sqrtf(u_mean[0]*u_mean[0] + u_mean[1]*u_mean[1] + u_mean[2]*u_mean[2]);
+#ifdef PC_PROBE
+            g_pc_probe_unorm = unorm;
+            g_pc_probe_nmag = (float)s_cal_n_mag;
+            g_pc_probe_anmean = an_mean;
+#endif
             /* ★ valid 只由【重力】决定。原写法把它与地磁绑定，使"地磁坏
              *   ⟹ 整个启动标定判失败"，这正是"地磁拖坏重力链"的结构性根源。
              *   地磁缺失时 valid 仍可为 1，只是 v_mag 不可用（偏航降级）。 */
@@ -750,6 +937,7 @@ void proc_eskf_step(float dt_s, const float *gyro_dps, const float *gyro_lsb,
         return;
     }
 
+    g_pc_ready = (float)s_eskf.ready; g_pc_calmag2 = (float)s_cal_n_mag; g_pc_valid2 = (float)s_eskf.valid;
     if (s_eskf.ready == 0u) return;
 
     /* ★ 运行累计转角(rad)：驱动【系统性】标度误差的方差增长。
@@ -821,9 +1009,45 @@ void proc_eskf_step(float dt_s, const float *gyro_dps, const float *gyro_lsb,
             }
             if (!(qg == qg) || (qg > 1.0f)) qg = (qg == qg) ? 1.0f : 1.2246e-6f;
         }
-        for (i = 0; i < 3u; i++)
-            for (j = 0; j < 3u; j++)
-                s_eskf.P[i][j] = FPFt[i][j] + (((i == j) ? qg : 0.0f));
+        /* ★★ 无重力期倾斜方差膨胀（2026-10-14 重建）
+         * 依据 docs/IGG-III稳健权设计记录.md §6.3 / §8:
+         *   ESKF_SIG_NOGRAV —— "重力长期不可用时膨胀倾斜方差"
+         *   §1 的物理式: σ_tilt = ESKF_SIG_NOGRAV · t_nograv
+         *
+         * ★ 设计原则（2026-10-14 定稿）：
+         *   P 是【一致性诊断量】，不是可以随便拧的旋钮。
+         *   IGG 的 rd = r/√S 判的是"新息相对滤波器自报不确定度是否异常"。
+         *   若 P 诚实（= 真实误差量级），正常误差下 rd ≈ 1 ⟹ 门自然开 ⟹ 不自锁；
+         *   若 P 撒谎（偏小），真实误差会被误判成 16σ 粗差 ⟹ w 落 WMIN ⟹ 锁死。
+         *   所以这里【不追求把 rd 压到某个目标】，只做一件事：
+         *   让 P 按【真实的倾角不确定度增长率】增长。
+         *
+         * ★ 增长率取值（用户 2026-10-14 定：直接用 3°）：
+         *   σ_tilt 在 t_nograv = 20 s 时达到 3°（文档记录的最恶劣连续无重力时长）
+         *   ⟹ N = 3° / 20 s = 0.052360 rad / 20 = 2.6180e-3 rad/√s
+         *   对照：本工程实测（x_025232_on，P∝t²）为 1.473e-3（17.69 s 时 1.492°），
+         *        文档陀螺漂移率 0.1366 °/s 为 2.384e-3。
+         *   取 2.618e-3 满足：① 与手册量级一致；② 大于实测 ⟹ P 增长快于真实误差
+         *   ⟹ 自带防锁裕度（这正是"P 不撒谎"的充要条件）。
+         *
+         * 注入方式【每步增量】: ΔP = 2·N²·t_nograv·dt_s，积分得 P = N²·t_nograv²
+         *   （即 σ_tilt = N·t_nograv 的平方，与 §1 物理式一致）。
+         *   grav_last 用于判断，因为预测步在本帧重力判定【之前】执行。
+         * 安全性: 累加器有上限、非有限守卫；只加对角（与陀螺 qg 同形）。 */
+        {
+            float infl = 0.0f;
+#ifdef ESKF_NOGRAV_INFL_OFF
+            (void)infl;         /* 仅用于单变量 A/B */
+#else
+            if (s_eskf.nograv_s > 0.0f) {
+                infl = 2.0f * ESKF_SIG_NOGRAV * ESKF_SIG_NOGRAV * s_eskf.nograv_s * dt_s;
+                if (!(infl == infl) || (infl > 1.0f)) infl = 0.0f;
+            }
+#endif
+            for (i = 0; i < 3u; i++)
+                for (j = 0; j < 3u; j++)
+                    s_eskf.P[i][j] = FPFt[i][j] + (((i == j) ? (qg + infl) : 0.0f));
+        }
     }
 #ifdef PC_PROBE
     g_pc_p_pre[0]=s_eskf.P[0][0]; g_pc_p_pre[1]=s_eskf.P[1][1]; g_pc_p_pre[2]=s_eskf.P[2][2];
@@ -839,27 +1063,98 @@ void proc_eskf_step(float dt_s, const float *gyro_dps, const float *gyro_lsb,
      *   姿态会被地磁拽得过紧、抖动增大。
      *   这正是"只有真正有磁的一拍才做观测"的默认做法。 */
     s_eskf.mag_corr_deg = 0.0f;
+    /* NOTE: g_pc_mv / g_pc_mn / g_pc_mr / g_pc_caln / g_pc_calmag 由 proc_mag.c 维护；
+     *       本文件只【定义】它们（PC_PROBE 下）供 pc_chain_main.c 链接，不在此处写入。 */
     /* ★★ 【临时开关】地磁观测总闸 ★★
-     *   ESKF_USE_MAG_OBS = 0 时完全不做地磁观测（不影响启动标定）：
-     *     · 启动窗口仍然采 mag_u 用于构造 v_mag 与 q0
-     *       （否则导航系无法建立）
-     *     · 但姿态推进中不再用地磁修正
-     *   改回 1 即恢复地磁观测。 */
+     *   ESKF_USE_MAG_OBS = 0 时完全不做地磁观测（不影响启动标定）。
+     *   默认 1（2026-10-14）：地磁观测为【唯一】观测，无门控。 */
 #ifndef ESKF_USE_MAG_OBS
-#define ESKF_USE_MAG_OBS    0
+#define ESKF_USE_MAG_OBS    1
 #endif
 #if ESKF_USE_MAG_OBS
-    if ((mag_valid != 0u) && (new_mag != 0u) && (s_eskf.mag_ref_ok != 0u)) {
+    /* ★★ 地磁观测【零门控】（2026-10-14，用户指示）
+     *   原条件 `(mag_valid) && (new_mag) && (mag_ref_ok)` 里，
+     *   mag_ref_ok 是【v_mag 是否由实测地磁构造】的标志；但 PC 复刻的 v_mag
+     *   是从录制通道注入的（proc_eskf_pc_set_vmag），该标志恒为 0 ⟹ 整条磁观测
+     *   被挡死（实测 col45 mv / col46 mn 全 0，attitude 对地磁零响应）。
+     *   现只保留两个【数据存在性】条件，不再有任何门控/阈值/增益缩放：
+     *     mag_valid : 本帧有有效磁样本（proc_mag.c 产出，SET 相）
+     *     new_mag   : 本帧确实是【新】磁拍（防同一份样本被多帧重复注入）
+     *   IGG 权已由 use_igg=0 关闭 ⟹ w ≡ 1.0；NIS 已改为只上报；
+     *   单帧限幅 ESKF_GRAV_DX_MAX_RAD 保持不变（对磁/重力同样作用）。 */
+    if ((mag_valid != 0u) && (new_mag != 0u)) {
         float h[3], z[3], c;
         for (i = 0; i < 3u; i++) z[i] = mag_u[i];
+        /* ★★ 导航系磁场参考 v_mag 的构造（2026-10-14，静止窗公式）
+         * 与 eskf_build_q0 的数学完全一致，只是数据源为【注入后的重启窗实测均值】：
+         *     zb = a_mean/|a_mean|;  um = u_mean/|u_mean|
+         *     yb = normalize(um − (um·zb)zb);  xb = zb × yb
+         *     R0 = [xb; yb; zb];  v_mag = R0·um   （vb = R0ᵀ，故 90−…）
+         * 物理含义：用【上电后实测的重力方向与地磁矢量方向】在世界系中定出姿态，
+         *   再求出地磁矢量在世界系的方向 —— 即用户要求的"上电测地磁世界系方向 +
+         *   自身上电姿态相较世界系的旋转"，无需假设上电后地磁在机体系的角度。
+         * ★ 为什么不用 Σ R(q)·z：那会把【滤波姿态自身的误差】固化进参考，
+         *   实测两者差 2.7°（Σ R(q)·z ⟹ 57.70°，静止窗公式 ⟹ 60.22° 口径下）。 */
+        if (s_vmag_ready == 0u) {
+            for (i = 0; i < 3u; i++) {
+                s_vmag_acc[i] += z[i];
+                s_vmag_aacc[i] += a_g[i];
+            }
+            s_vmag_cnt++;
+            if (s_vmag_cnt >= ESKF_VMAG_NWIN) {
+                float inv = 1.0f / (float)s_vmag_cnt;
+                float am[3], um[3], zb[3], yb[3], xb[3];
+                float na, nu, dp, ny;
+                for (i = 0; i < 3u; i++) { am[i] = s_vmag_aacc[i] * inv; um[i] = s_vmag_acc[i] * inv; }
+                /* ★ 只算 v_mag，【不调用 eskf_build_q0】—— 那个函数会覆盖 s_eskf.q，
+                 *   而 PC 复刻的姿态是由录制注入的，不可被破坏。
+                 *   公式与 eskf_build_q0 完全一致（R0 = [xb;yb;zb] 为体→导航）： */
+                na = sqrtf(am[0]*am[0] + am[1]*am[1] + am[2]*am[2]);
+                nu = sqrtf(um[0]*um[0] + um[1]*um[1] + um[2]*um[2]);
+                if ((na > 1e-6f) && (nu > 1e-9f)) {
+                    for (i = 0; i < 3u; i++) { zb[i] = am[i] / na; um[i] = um[i] / nu; }
+                    dp = um[0]*zb[0] + um[1]*zb[1] + um[2]*zb[2];
+                    for (i = 0; i < 3u; i++) yb[i] = um[i] - dp * zb[i];
+                    ny = sqrtf(yb[0]*yb[0] + yb[1]*yb[1] + yb[2]*yb[2]);
+                    if (ny > 1e-6f) {
+                        for (i = 0; i < 3u; i++) yb[i] /= ny;
+                        xb[0] = zb[1]*yb[2] - zb[2]*yb[1];
+                        xb[1] = zb[2]*yb[0] - zb[0]*yb[2];
+                        xb[2] = zb[0]*yb[1] - zb[1]*yb[0];
+                        /* v_mag = R0 · um = (xb·um, yb·um, zb·um) */
+                        s_eskf.v_mag[0] = xb[0]*um[0] + xb[1]*um[1] + xb[2]*um[2];
+                        s_eskf.v_mag[1] = yb[0]*um[0] + yb[1]*um[1] + yb[2]*um[2];
+                        s_eskf.v_mag[2] = zb[0]*um[0] + zb[1]*um[1] + zb[2]*um[2];
+                        {
+                            float nn = sqrtf(s_eskf.v_mag[0]*s_eskf.v_mag[0]
+                                           + s_eskf.v_mag[1]*s_eskf.v_mag[1]
+                                           + s_eskf.v_mag[2]*s_eskf.v_mag[2]);
+                            if (nn > 1e-6f) {
+                                for (i = 0; i < 3u; i++) s_eskf.v_mag[i] /= nn;
+                                s_eskf.mag_ref_ok = 1u;   /* 参考已由实测静止窗构造完成 */
+                            }
+                        }
+                    }
+                }
+                s_vmag_ready = 1u;
+            }
+        }
         nav_to_body(s_eskf.q, s_eskf.v_mag, h);
         c = z[0]*h[0] + z[1]*h[1] + z[2]*h[2];
         if (c > 1.0f) c = 1.0f; if (c < -1.0f) c = -1.0f;
         s_eskf.mag_resid_deg = acosf(c) * ESKF_RAD2DEG;
-        {
+        /* ★★ 磁观测 = 纯净路径（2026-10-14 用户要求）：
+         *   无门控、无 IGG 降权、无单帧限幅、无"地磁不可用"兜底。
+         *   use_igg = 0 同时关掉 IGG 与单帧限幅（见 eskf_update 内说明）。
+         *   v_mag 由累加窗从【实测】构造；窗满前 v_mag 尚未定义（初值 [0,1,0]
+         *   与真实场差 56.8°），此时施加观测没有意义且会把姿态拉歪
+         *   （实测：无此保护时前 2 s 姿态差 17.5°、后段仍差 10°）。
+         *   故仅在 v_mag 构造完成前【不施加观测】—— 这是"观测尚无定义"，
+         *   不是门控/降权/阈值/限幅。构造完成后即全程无任何限制地施加。 */
+        if (s_vmag_ready != 0u) {
             float rp = ESKF_MAG_PERP_DEG * ESKF_DEG2RAD;
             float rq = ESKF_MAG_PAR_DEG  * ESKF_DEG2RAD;
-            s_eskf.mag_corr_deg = eskf_update(s_eskf.v_mag, z, rp*rp, rq*rq) * ESKF_RAD2DEG;
+            s_eskf.mag_corr_deg = eskf_update(s_eskf.v_mag, z, rp*rp, rq*rq, 0u) * ESKF_RAD2DEG;
         }
     }
 #endif  /* ESKF_USE_MAG_OBS */
@@ -883,6 +1178,17 @@ void proc_eskf_step(float dt_s, const float *gyro_dps, const float *gyro_lsb,
 
         avn = sqrtf(gyro_dps[0]*gyro_dps[0] + gyro_dps[1]*gyro_dps[1]
                   + gyro_dps[2]*gyro_dps[2]);
+#ifdef PC_PROBE
+        /* 门诊断探针：an / avn / resid(°) 逐帧上报，用于定位门为何不开 */
+        g_pc_gate_an = an;
+        g_pc_gate_avn = avn;
+        g_pc_gate_res = (float)(resid * ESKF_RAD2DEG);
+        /* 磁诊断：链内真实使用的 mag_u 与算出的 mag_resid */
+        g_pc_mux = mag_u[0]; g_pc_muy = mag_u[1]; g_pc_muz = mag_u[2];
+        g_pc_mres = s_eskf.mag_resid_deg;
+        g_pc_vmx = s_eskf.v_mag[0]; g_pc_vmy = s_eskf.v_mag[1]; g_pc_vmz = s_eskf.v_mag[2];
+        g_pc_mrok = (float)s_eskf.mag_ref_ok;
+#endif
 
         /* ★★ 诚实卡尔曼原生门控（2026-10-13）
          *    实现 docs/ekf_native_gate_design.md §1 / §2.4 / §3。
@@ -905,15 +1211,32 @@ void proc_eskf_step(float dt_s, const float *gyro_dps, const float *gyro_lsb,
          *   而 P 由 Q 驱动增长（§1: Q_θθ = q_arw·dt + (k_s·|ω|·dt)²）⟹ 运动越多越信重力，
          *   这正是"交叉点自动涌现"，与"误差越大门越关"的正反馈方向相反。
          * 保留的两个门都是"加计是否可信"的物理判据，与姿态误差大小无关。 */
-        if ((fabsf(an - 1.0f) < ESKF_ACC_MAGLIM_G) && (avn < ESKF_GRAV_WLIM_DPS)) {
-            float rs = ESKF_ACC_SIG_DEG * ESKF_DEG2RAD;
-            float applied = eskf_update(s_eskf.v_up, z, rs*rs, rs*rs);
+        if ((fabsf(an - 1.0f) < ESKF_ACC_MAGLIM_G) && (avn < ESKF_GRAV_WLIM_DPS)) {            float rs = ESKF_ACC_SIG_DEG * ESKF_DEG2RAD;
+            float applied = eskf_update(s_eskf.v_up, z, rs*rs, rs*rs, 1u);
 #ifdef PC_PROBE
             g_pc_applied = applied;
 #endif
             s_eskf.grav_open = (applied >= 0.0f) ? 1u : 0u;   /* NIS 拒绝返回 -1 */
         }
         (void)resid;   /* resid 仍用于下方 acc_resid_deg 诊断上报 */
+
+        /* ★★ 无重力期计时（2026-10-14 重建，供下一帧预测步的 P 膨胀使用）
+         *   门开 ⟹ 归零（重力在场，P 由观测收敛）
+         *   门关 ⟹ 累加 dt_s（重力缺席，P 按 σ_tilt = SIG_NOGRAV·t_nograv 增长） */
+        /* ★★ 无重力期时长 t_nograv（供下一帧预测步的倾斜方差注入使用）
+         *   门开 ⟹ 归零（重力在场，P 由观测按比例回落）
+         *   门关 ⟹ 累加 dt_s
+         * 注意：预测步在本判定之前执行，故注入用的是【上一帧】的 t_nograv。 */
+        if (s_eskf.grav_open != 0u) {
+            s_eskf.nograv_s = 0.0f;
+        } else if ((dt_s == dt_s) && (dt_s > 0.0f) && (dt_s < 0.05f)) {
+            s_eskf.nograv_s += dt_s;
+            if (s_eskf.nograv_s > 1.0e4f) s_eskf.nograv_s = 1.0e4f;
+        }
+        s_eskf.grav_last = s_eskf.grav_open;
+#ifdef PC_PROBE
+        g_pc_nograv = s_eskf.nograv_s;
+#endif
     }
 #endif
 
@@ -942,3 +1265,6 @@ void proc_eskf_step(float dt_s, const float *gyro_dps, const float *gyro_lsb,
         s_eskf.p_perp = sqrtf(((tr - vp) * 0.5f) > 0.0f ? (tr - vp) * 0.5f : 0.0f);
     }
 }
+
+
+

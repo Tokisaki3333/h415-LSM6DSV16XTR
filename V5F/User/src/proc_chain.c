@@ -206,6 +206,9 @@ void proc_chain_step(const volatile shared_mem_t *shm)
         mu[1] = g_proc.mag_u[1];
         mu[2] = g_proc.mag_u[2];
 
+#ifdef PC_PROBE
+        { extern float g_pc_mvcall, g_pc_mncall; g_pc_mvcall = (float)g_proc.mag_valid; g_pc_mncall = (float)proc_mag_is_new(); }
+#endif
         proc_eskf_step(dt_s, g_proc.gyro_dps, g_proc.gyro_lsb, av, mu,
                        g_proc.mag_valid, proc_mag_is_new(), tick);
 

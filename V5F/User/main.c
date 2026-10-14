@@ -107,7 +107,26 @@ int main(void)
          * 保留 t_next 计时以免引入未使用变量。 */
         if ((int64_t)(t_next - GetTime64_Us()) <= 0)
         {
-            t_next = GetTime64_Us() + 5000000ULL;
+            t_next = GetTime64_Us() + 1000000ULL;   /* ★ 2026-10-14: 5 s -> 1 s */
+
+            /* ★★ 2026-10-14 新增：示例 —— 主循环每 1 s 向 V3F 发一次 RESET 请求。
+             *
+             * 机制（共享区末尾新增的三个字段，见 mipc_shm.h）：
+             *   V5F: mmc_rst_req++            —— 单调自增，表示"请做一次 RESET 周期"
+             *   V3F: 在 MMC DRDY 中断里比对 mmc_rst_req 与本地记账，
+             *        有差异则本拍切进 RESET 段；完成后 mmc_rst_done++ 回执
+             * 极性仍由既有 g_shm->mmc.pol 上报 ⟹ 解析与上报路径零改动。
+             *
+             * 为什么按需发起而不是让 V3F 自己周期翻转：
+             *   时刻可知可记录 ⟹ SET/RESET 对在时间上良定义 ⟹ 可做【差分】
+             *       (SET − RST)/2 = B + (b_SET − b_RST)/2   ← 场矢量，对硬磁零点免疫
+             *   作为与 SET-only 单相路径的独立交叉校验（用于硬磁阶跃变化的告警）。
+             *   ★ 绝不可用 (SET + RST)/2 —— 那是被禁的中点零点（残余 = 场强 21.6%）。
+             *
+             * mmc_rst_hz_x10 = 10 表示期望 1.0 Hz；置 0 则 V3F 退回本地
+             * MMC_FLIP_PERIOD（1024 个 SET 一次）的兼容周期。 */
+            g_shm->mmc_rst_hz_x10 = 10u;
+            g_shm->mmc_rst_req++;
         }
 
         /* ---- 锁存最新的磁原始值（约 1 kHz 更新） ---- */
@@ -203,7 +222,12 @@ int main(void)
                                        (float)g_shm->imu.ax * ACCEL_G_PER_LSB,
                                        (float)g_shm->imu.ay * ACCEL_G_PER_LSB,
                                        (float)g_shm->imu.az * ACCEL_G_PER_LSB,
-                                       g_proc.mag_u[0], g_proc.mag_u[1], g_proc.mag_u[2],
+                                       /* ★★ 2026-10-13: col14..16 原为 mag_u, 实测恒为 0（proc_mag 未产出矢量）⟹
+   * 改报 IGG-III 的两个关键中间量, 供烧录后判断内部是否按预期工作:
+   *   col14 = IGG 鲁棒权 w ∈ [1e-3, 1]      期望: 干净静止≈1, 慢转/平动/翻滚≈1e-3
+   *   col15 = d = rᵀ S⁻¹ r（χ²(2)）          期望: 静止≈2, 运动段≫1
+   *   col16 = 0（保留） */
+  proc_eskf_grav_w(), proc_eskf_grav_nis(), 0.0f,
                                        f,
                                        ts_hi24,
                                        (float)(g_shm->imu.hdr.cnt & 0x00FFFFFFu),

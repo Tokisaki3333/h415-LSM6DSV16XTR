@@ -219,7 +219,15 @@ int MMC_Init(void)
      *    CTRL0 里的 INT_meas_done_en 仍然置位（mmc_cfg_ex 内部写死），
      *    这样后面一开连续转换，测量完成就会拉高 INT。 */
     if (mmc_wr(MMC5983MA_REG_CTRL1, MMC5983MA_CTRL1_BW_11) != 0)
-        return MMC_ERR_SPI;                         /* BW=11: 0.5ms/800Hz/1.2mG */
+        return MMC_ERR_SPI;
+    /* ★ 2026-10-14 更正：原注释写作 "BW=11: 0.5ms/800Hz/1.2mG" —— 自相矛盾
+     *   （0.5 ms 对应 2000 Hz，不是 800 Hz），且曾被我误当作"当前档的器件速率"
+     *   去解释实测 768 Hz，属错误依据。
+     * 可核实的只有两条：
+     *   (a) mmc5983ma_reg.h 明载 CM_FREQ_1000HZ【要求 BW=11】⟹ BW=11 是本器件
+     *       能达到最高输出速率档的必要带宽设置；
+     *   (b) BW 越宽 ⟹ 测量越快、噪声越大（本注释原想表达的取舍）。
+     *   ⟹ 具体 ms/Hz/噪声 数值须查手册表格，不得凭此注释推断。 */
     if (mmc_wr(MMC5983MA_REG_CTRL3, 0x00u) != 0)
         return MMC_ERR_SPI;                         /* 4 线 SPI */
     if (mmc_cfg_ex(0u, 0u, 0u) != MMC_OK)           /* cmm_en=0：不启动测量 */

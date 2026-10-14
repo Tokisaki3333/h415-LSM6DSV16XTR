@@ -189,6 +189,29 @@ typedef struct {
      * V5F 在 DMA 完成中断【入口处】读，使与数据帧的配对窗口最小。 */
     chan_hdr_t        imu_drdy;
     chan_hdr_t        mmc_drdy;         /* 地磁 DRDY 时刻（供 V5F 对齐用） */
+
+    /* ★★ 末尾追加（2026-10-14）——绝不可插到中间！（同 2026-10-13 追加时的约定：
+     *   插在中间会让 log/imu/mmc/bmp/全部 GPS 通道/oled_fb 的偏移整体平移，
+     *   两核若非同时重建就全面错位。追加在末尾则既有偏移一字不动。）
+     *
+     * V5F → V3F 的【按需 RESET 请求】通道。
+     *
+     * 动机：让 RESET 由主算法端（V5F）按需发起，而不是由 V3F 本地周期计数决定。
+     *   时刻可知、可记录 ⟹ SET/RESET 对在时间上良定义 ⟹ 可做【差分】交叉校验：
+     *        (SET − RST)/2 = B + (b_SET − b_RST)/2   ← 场矢量，对硬磁零点免疫
+     *   ★ 绝不可用 (SET + RST)/2 —— 那是被禁的中点零点（残余 |Δ|/2 = 场强 21.6%）。
+     *
+     * 协议：单调自增计数器（单写单读，天然无竞争，无需锁，无需 ts/cnt 发布协议）。
+     *     V5F: mmc_rst_req++            —— 表示"请尽快做一次 RESET 周期"
+     *     V3F: 在 MMC DRDY 中断里比对 mmc_rst_req 与本地记账，
+     *          有差异则本拍切进 RESET 段；RESET 周期结束后 mmc_rst_done++ 作为回执
+     * 判读：req 与 done 同步增长 = 正常；req 持续领先 done = V3F 未响应（查中断是否活）。
+     *
+     * RESET 的极性仍走既有 mmc.pol 上报路径 ⟹ V5F 侧解析与上报【零改动】。
+     * mmc_rst_hz_x10 = 0 时 V3F 沿用本地 MMC_FLIP_PERIOD 周期（向后兼容）。 */
+    volatile uint32_t mmc_rst_req;      /* V5F 写(自增) / V3F 读 */
+    volatile uint32_t mmc_rst_done;     /* V3F 写(自增) / V5F 读(回执) */
+    volatile uint32_t mmc_rst_hz_x10;   /* V5F 写: 期望频率×10（10=1 Hz）; 0=沿用本地周期 */
 } shared_mem_t;
 
 /* 共享区指针：V3F 定义 storage 并由 g_shm 指向（地址经 IPC_MSG0 传给 V5F）；V5F 同样以 g_shm 命名 */

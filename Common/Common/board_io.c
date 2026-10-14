@@ -472,9 +472,38 @@ volatile uint64_t g_imu_drdy_ts  = 0u;   /* 本拍 DRDY 时刻（10ns）*/
 static volatile uint8_t s_polarity = 0u;
 
 /* ★ 每 MMC_FLIP_PERIOD 个 SET 周期才做一次 RESET 周期（原实现为每拍翻转）。
- *   复位后由 RESET 分支清零，重新累计。 */
+ *   复位后由 RESET 分支清零，重新累计。
+ *   ★ 2026-10-14：本周期计数降级为【兼容/兜底】路径 —— 当共享区的
+ *     mmc_rst_hz_x10 == 0（V5F 未接管）时仍按它周期性翻转；
+ *     V5F 一旦置 mmc_rst_hz_x10 != 0，翻转时机改由 mmc_rst_req 按需驱动。 */
 #define MMC_FLIP_PERIOD         1024u
 static volatile uint32_t s_mmc_flip_cnt = 0u;
+
+/* ★★ 2026-10-14 新增：按需 RESET 的本地记账。
+ *   语义："已受理到的 mmc_rst_req 序号"。在 MMC DRDY 中断里与共享区比对，
+ *   不等则本拍切进 RESET 段。单写单读（只有本 ISR 写），无需原子操作。 */
+static volatile uint32_t s_mmc_rst_seen = 0u;
+
+/* ★★ 2026-10-14 新增：连续 SET 段是否已让器件进入【连续采样模式】。
+ *
+ * 机理（本轮修正的核心）：
+ *   MMC5983MA 的 CTRL2.Cmm_en=1 时，器件【自主】按 CM_FREQ 连续测量并拉 DRDY；
+ *   而 CTRL0.TM_M 是"触发【一次】测量"。原实现在连续 SET 分支里【每拍都写
+ *   CTRL0 = TM_M|INT_MEAS_EN|AUTO_SR_EN】⟹ 等价于每拍单次触发 ⟹ 器件被迫等
+ *   ISR 来喂下一拍 ⟹ 速率被 ISR 循环钳住（实测 768 Hz，而器件 BW=11 下可达
+ *   1000+ Hz）。且当时 CTRL2.Cmm_en 在第一次 RESET 段被关掉后【从未恢复】。
+ *
+ * 正确做法（本轮）：
+ *   连续 SET 段: 只保证 CTRL2 = CM_FREQ|Cmm_en|Prd_set_en 已被写一次，
+ *                【不再每拍写 CTRL0】⟹ 器件自主全速采样。
+ *   需要 RST 时: 切出连续模式 → 现有 RESET 特殊时序 → 收尾时【恢复连续模式】。
+ * 本标志用于"只写一次"，避免每拍重复写 CTRL2。 */
+static volatile uint8_t s_mmc_cmm_on = 0u;
+
+/* 连续模式的 CTRL2 组合值：CM_FREQ_1000HZ | CMM_EN | PRD_SET_EN = 0x8F */
+#define MMC_CTRL2_CMM_COMBO  ((uint8_t)(MMC5983MA_CM_FREQ_1000HZ | \
+                                        MMC5983MA_CTRL2_CMM_EN |     \
+                                        MMC5983MA_CTRL2_EN_PRD_SET))
 
 /* 上一周期的 RESET 样本（暂存），与下一周期首个 SET 配对 —— 归档同一机制。
  * 配对窗口约 623us，是 SET/RESET 之间时间上最接近的一对。 */
@@ -532,91 +561,146 @@ void EXTI7_0_IRQHandler(void)
                            (uint8_t)(MMC5983MA_ST_MEAS_M_DONE |
                                      MMC5983MA_ST_MEAS_T_DONE));
 
-        /* 配对：本周期 RESET + 下一周期首个 SET（时间上最接近，外界磁场相消最干净）。
-         * 判据即"上一拍是 SET 且手上还留着 RESET 样本"，不用时间戳。 */
-
+        /* ★★ 2026-10-14 修正：此处原累加 (RST + SET)/2 —— 那是【两相中点】，
+         *   即 地磁解析根因_定位.md §五-1 明令禁止的 E4 口径。
+         *   实测两相是两个不同心的球（球心距 3588 counts = 场强 43.15%），
+         *   中点不是任何一相的球心，残余 |Δ|/2 = 1794 counts = 场强 21.6%，
+         *   会产生 ±21.6% 的确定性方向调制。
+         *   该累加器（g_mmc_pair_sum / g_mmc_pair_n）全工程【只写不读】，从未生效，
+         *   故这里停止累加，避免后人误用。声明保留不改（避免 ABI/引用面变化）。
+         *   ★ 若将来要用这个对，正确的量是【差分】(SET − RST)/2 —— 它等于场矢量，
+         *     对硬磁零点免疫；不是零点。 */
         if (s_polarity == 0u && s_have_rst != 0u)
         {
-            g_mmc_pair_sum[0] += ((int64_t)s_pend_rst[0] + (int64_t)g_mmc_raw[0]) / 2;
-            g_mmc_pair_sum[1] += ((int64_t)s_pend_rst[1] + (int64_t)g_mmc_raw[1]) / 2;
-            g_mmc_pair_sum[2] += ((int64_t)s_pend_rst[2] + (int64_t)g_mmc_raw[2]) / 2;
-            g_mmc_pair_n++;
-            s_have_rst = 0u;
+            s_have_rst = 0u;            /* 仅消费暂存，不再累加中点 */
         }
 
         /* --- 4) 决定下一拍 ---
-         * ★ 唯一改动：由"每拍翻转"改为"每 MMC_FLIP_PERIOD 个 SET 周期才做一次 RESET 周期"。
-         *   SET 分支（s_polarity==0，本拍是 SET）：连续走 MMC_FLIP_PERIOD 次，
-         *     第 MMC_FLIP_PERIOD 次才切到 RESET 段；
-         *   RESET 分支（s_polarity==1，本拍是 RESET）：只走一次就切回 SET 段。
-         *   两个分支体内的寄存器操作与等待【一字未改】，仅由计数器决定何时进入。 */
-        if (s_mmc_flip_cnt < MMC_FLIP_PERIOD)
+         * ★ 2026-10-14 改动：RESET 时机由【V5F 的按需请求】驱动，取代本地周期计数。
+         *   动机：主算法端发起 ⟹ 时刻可知可记录 ⟹ SET/RESET 对在时间上良定义，
+         *         可做【差分】(SET−RST)/2 交叉校验（对硬磁零点免疫）。
+         *   兼容：mmc_rst_hz_x10 == 0 或共享区不可用时，退回本地 MMC_FLIP_PERIOD 周期。
+         *   ★ RESET 段两个分支体内的寄存器操作与等待【一字未改】，
+         *     只换了"何时进入"的判据。 */
         {
-            /* 仍处于连续 SET 段：不发 RESET 脉冲、不切状态，
-             * 但【必须照常触发下一次测量】—— 器件是单次触发模式
-             * （CTRL2 不带 CMM_EN），不触发就没有新样本。
-             * 触发器沿用本文件 RESET 分支里已有的那一行，一字不改。 */
-            (void)SPI_WriteReg(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN,
-                               MMC5983MA_REG_CTRL0,
-                               (uint8_t)(MMC5983MA_CTRL0_TM_M |
-                                         MMC5983MA_CTRL0_INT_MEAS_EN |
-                                         MMC5983MA_CTRL0_AUTO_SR_EN));
-            s_mmc_flip_cnt++;
-        }
-        else if (s_polarity == 0u)
-        {
-            /* 本拍是 SET。SET 段只取【一个】样本，
-             * 接下来要切到 RESET 段（归档 b=1 的等价形式）。
-             *
-             * 归档顺序：先 cfg_ex(0,0,0) 关连续与自动 SET，
-             * 再 pulse(RESET)，再 ConsumePending，
-             * 最后 TriggerAndRead 读真正的 RESET 样本。 */
-            /* 归档 mmc_cfg_ex(0,0,0)：CTRL0 = INT_MEAS_EN（关自动 SET），
-             * CTRL2 = CM_FREQ_1000HZ（不带 CMM_EN，即关连续转换）。
-             * 两个寄存器都必须写 —— CTRL2 的 CMM_EN 才是连续模式的开关。 */
-            (void)SPI_WriteReg(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN,
-                               MMC5983MA_REG_CTRL0,
-                               MMC5983MA_CTRL0_INT_MEAS_EN);
-            (void)SPI_WriteReg(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN,
-                               MMC5983MA_REG_CTRL2,
-                               (uint8_t)MMC5983MA_CM_FREQ_1000HZ);
+            /* ★★ 2026-10-14：状态优先 —— 正在 RESET 序列中（s_polarity==1）
+             *   必须【走完】，绝不能被 want_rst 判据打断。
+             *   否则：request 受理时已把 rst_seen 记到 req，下一拍 want_rst 变 0，
+             *   状态机就再也进不到收尾分支 ⟹ s_polarity 永远停在 1、
+             *   done 永不增长、pol 上报全错（把 SET 报成 RST）⟹ SET-only 管线全毁。
+             *   该缺陷由 verify_rst_fsm.py 的状态机仿真抓出。 */
+            if (s_polarity == 1u)
+            {
+                /* 本拍是 RESET：暂存供下一周期首个 SET 配对，然后恢复自动 SET */
+                s_pend_rst[0] = g_mmc_raw[0];
+                s_pend_rst[1] = g_mmc_raw[1];
+                s_pend_rst[2] = g_mmc_raw[2];
+                s_have_rst = 1u;
 
-            /* RESET 脉冲；等待时间见 mmc5983.h 的 MMC_RST_PULSE_WAIT_US */
-            (void)SPI_WriteReg(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN,
-                               MMC5983MA_REG_CTRL0, MMC5983MA_CTRL0_RESET);
-            HWT_DelayUs(MMC_RST_PULSE_WAIT_US);
+                /* ★★ 2026-10-14 修正（核心）：RESET 周期收尾必须【恢复连续模式】。
+                 * 原实现只写 CTRL0，从不把 Cmm_en 恢复进 CTRL2 ⟹
+                 * 第一次 RESET 之后器件永久退出连续采样，此后每拍都要 ISR 显式触发
+                 * ⟹ 速率被钳住。这里把 CTRL2 写回连续模式组合，并清记账。 */
+                (void)SPI_WriteReg(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN,
+                                   MMC5983MA_REG_CTRL0,
+                                   (uint8_t)(MMC5983MA_CTRL0_INT_MEAS_EN |
+                                             MMC5983MA_CTRL0_AUTO_SR_EN));
+                (void)SPI_WriteReg(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN,
+                                   MMC5983MA_REG_CTRL2, MMC_CTRL2_CMM_COMBO);
+                s_mmc_cmm_on = 1u;
 
-            /* 不需要 MMC_ConsumePending：数据由 DRDY 中断取，
-             * 每拍都对应一次完成的转换，不存在读到旧转换的问题；
-             * 调用它反而会白等一整个转换周期（约 826us）。 */
+                /* ★ 本次 RESET 周期结束：计数清零，回到连续 SET 段 */
+                s_mmc_flip_cnt = 0u;
+                s_polarity = 0u;
 
-            /* 触发并读真正的 RESET 样本：本中断返回后由 DRDY 拉起来 */
-            (void)SPI_WriteReg(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN,
-                               MMC5983MA_REG_CTRL0,
-                               (uint8_t)(MMC5983MA_CTRL0_TM_M |
-                                         MMC5983MA_CTRL0_INT_MEAS_EN));
+                /* ★★ 给 V5F 的回执。按需模式下 req/done 应同步增长；
+                 *   若 req 持续领先 done，说明本 ISR 未在跑（地磁失效，见 MMC_RecoverPoll）。 */
+                if (g_shm != 0)
+                    g_shm->mmc_rst_done++;
+            }
+            else
+            {
+                uint8_t want_rst = 0u;
 
-            s_polarity = 1u;
-        }
-        else
-        {
-            /* 本拍是 RESET：暂存供下一周期首个 SET 配对，然后恢复自动 SET */
-            s_pend_rst[0] = g_mmc_raw[0];
-            s_pend_rst[1] = g_mmc_raw[1];
-            s_pend_rst[2] = g_mmc_raw[2];
-            s_have_rst = 1u;
+                if (g_shm != 0)
+                {
+                    if (g_shm->mmc_rst_hz_x10 != 0u)
+                    {
+                        /* 按需模式：存在未受理的请求 ⟹ 本拍切进 RESET 段 */
+                        if (g_shm->mmc_rst_req != s_mmc_rst_seen)
+                            want_rst = 1u;
+                    }
+                    else if (s_mmc_flip_cnt >= MMC_FLIP_PERIOD)
+                    {
+                        want_rst = 1u;      /* 兼容：本地周期到点 */
+                    }
+                }
+                else if (s_mmc_flip_cnt >= MMC_FLIP_PERIOD)
+                {
+                    want_rst = 1u;
+                }
 
-            /* 恢复自动 SET 并触发下一拍 SET */
-            (void)SPI_WriteReg(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN,
-                               MMC5983MA_REG_CTRL0,
-                               (uint8_t)(MMC5983MA_CTRL0_TM_M |
-                                         MMC5983MA_CTRL0_INT_MEAS_EN |
-                                         MMC5983MA_CTRL0_AUTO_SR_EN));
+                if (want_rst == 0u)
+                {
+                    /* ★★ 2026-10-14 修正（核心）：
+                     * 连续 SET 段【不再每拍写 CTRL0 触发】。
+                     * 器件在 Cmm_en=1 时自主按 CM_FREQ 连续测量并拉 DRDY；
+                     * 每拍写 TM_M 等于强制单次触发 ⟹ 速率被 ISR 循环钳住。
+                     * 这里只保证连续模式的 CTRL2 组合已被写过一次。 */
+                    if (s_mmc_cmm_on == 0u)
+                    {
+                        (void)SPI_WriteReg(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN,
+                                           MMC5983MA_REG_CTRL0,
+                                           (uint8_t)(MMC5983MA_CTRL0_INT_MEAS_EN |
+                                                     MMC5983MA_CTRL0_AUTO_SR_EN));
+                        (void)SPI_WriteReg(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN,
+                                           MMC5983MA_REG_CTRL2, MMC_CTRL2_CMM_COMBO);
+                        s_mmc_cmm_on = 1u;
+                    }
+                    if (s_mmc_flip_cnt < 0xFFFFFFFFu) s_mmc_flip_cnt++;
+                }
+                else
+                {
+                    /* ★ 受理本请求（按需模式下才记账；兼容模式下计数已在 RESET 段末尾清零） */
+                    if (g_shm != 0 && g_shm->mmc_rst_hz_x10 != 0u)
+                        s_mmc_rst_seen = g_shm->mmc_rst_req;
 
-            /* ★ 本次 RESET 周期结束：计数清零，接下来重新累计 MMC_FLIP_PERIOD 个 SET 周期 */
-            s_mmc_flip_cnt = 0u;
-            s_polarity = 0u;
-        }
+                    /* 本拍是 SET。SET 段只取【一个】样本，
+                     * 接下来要切到 RESET 段（归档 b=1 的等价形式）。
+                     *
+                     * 归档顺序：先 cfg_ex(0,0,0) 关连续与自动 SET，
+                     * 再 pulse(RESET)，再 ConsumePending，
+                     * 最后 TriggerAndRead 读真正的 RESET 样本。 */
+                    /* 归档 mmc_cfg_ex(0,0,0)：CTRL0 = INT_MEAS_EN（关自动 SET），
+                     * CTRL2 = CM_FREQ_1000HZ（不带 CMM_EN，即关连续转换）。
+                     * 两个寄存器都必须写 —— CTRL2 的 CMM_EN 才是连续模式的开关。 */
+                    (void)SPI_WriteReg(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN,
+                                       MMC5983MA_REG_CTRL0,
+                                       MMC5983MA_CTRL0_INT_MEAS_EN);
+                    (void)SPI_WriteReg(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN,
+                                       MMC5983MA_REG_CTRL2,
+                                       (uint8_t)MMC5983MA_CM_FREQ_1000HZ);
+                    s_mmc_cmm_on = 0u;      /* ★ 已切出连续模式 */
+
+                    /* RESET 脉冲；等待时间见 mmc5983.h 的 MMC_RST_PULSE_WAIT_US */
+                    (void)SPI_WriteReg(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN,
+                                       MMC5983MA_REG_CTRL0, MMC5983MA_CTRL0_RESET);
+                    HWT_DelayUs(MMC_RST_PULSE_WAIT_US);
+
+                    /* 不需要 MMC_ConsumePending：数据由 DRDY 中断取，
+                     * 每拍都对应一次完成的转换，不存在读到旧转换的问题；
+                     * 调用它反而会白等一整个转换周期（约 826us）。 */
+
+                    /* 触发并读真正的 RESET 样本：本中断返回后由 DRDY 拉起来 */
+                    (void)SPI_WriteReg(MMC_SPI, MMC_CS_PORT, MMC_CS_PIN,
+                                       MMC5983MA_REG_CTRL0,
+                                       (uint8_t)(MMC5983MA_CTRL0_TM_M |
+                                                 MMC5983MA_CTRL0_INT_MEAS_EN));
+
+                    s_polarity = 1u;
+                }
+            }
+        }   /* ★ 结束 2026-10-14 新增的作用域块 */
     }
 }
 
