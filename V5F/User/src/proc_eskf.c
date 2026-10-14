@@ -327,15 +327,20 @@ float g_pc_ready = 0.0f, g_pc_calmag2 = 0.0f, g_pc_valid2 = 0.0f;
 float g_pc_mres = 0.0f, g_pc_mux = 0.0f, g_pc_muy = 0.0f, g_pc_muz = 0.0f;
 float g_pc_vmx = 0.0f, g_pc_vmy = 0.0f, g_pc_vmz = 0.0f, g_pc_mrok = 0.0f;
 float g_pc_probe_unorm = 0.0f, g_pc_probe_nmag = 0.0f, g_pc_probe_anmean = 0.0f;
-/* v_mag 重建累加器（仅 PC 注入路径使用） */
-static float s_vmag_acc[3] = {0.0f, 0.0f, 0.0f};
-static float s_vmag_aacc[3] = {0.0f, 0.0f, 0.0f};   /* 静止窗内加计累加（供 eskf_build_q0） */
+const char *g_pc_eskf_ver = ESKF_BUILD_VER;
+#endif
+
+/* ★★ 导航系磁场参考 v_mag 的【静止窗累加器】（2026-10-14）
+ * ★ 这是产品逻辑（板载与 PC 都要用），绝不可放进 #ifdef PC_PROBE：
+ *   MCU 构建无 PC_PROBE ⟹ 会全部"未声明"（v5f 编译失败的根因）。
+ * 窗内累加实测 a_g 与磁单位矢量；窗满后用与 eskf_build_q0 等价的公式
+ * 构造 v_mag（见下方磁观测分支）。 */
+static float s_vmag_acc[3]  = {0.0f, 0.0f, 0.0f};   /* 磁单位矢量累加 */
+static float s_vmag_aacc[3] = {0.0f, 0.0f, 0.0f};   /* 加计累加（供体->导航参考系） */
 static uint16_t s_vmag_cnt = 0u;
-static uint8_t s_vmag_ready = 0u;
+static uint8_t  s_vmag_ready = 0u;
 #ifndef ESKF_VMAG_NWIN
 #define ESKF_VMAG_NWIN  1000u     /* 累加窗：1000 个磁样本 ≈ 0.83 s */
-#endif
-const char *g_pc_eskf_ver = ESKF_BUILD_VER;
 #endif
 float proc_eskf_grav_w(void)   { return s_last_w; }
 float proc_eskf_grav_nis(void) { return s_last_nis; }
@@ -708,6 +713,13 @@ static void eskf_calib_reset(void)
     s_eskf.grav_open = 0u;
     s_eskf.nograv_s = 0.0f;         /* ★ 无重力期计时（P 膨胀用） */
     s_eskf.grav_last = 0u;
+    /* v_mag static-window accumulators reset.
+     * MUST be on the product path: the board never calls proc_eskf_pc_inject,
+     * so resetting only there would leave stale accumulators after a board reset. */
+    s_vmag_acc[0] = s_vmag_acc[1] = s_vmag_acc[2] = 0.0f;
+    s_vmag_aacc[0] = s_vmag_aacc[1] = s_vmag_aacc[2] = 0.0f;
+    s_vmag_cnt = 0u;
+    s_vmag_ready = 0u;
 }
 
 void proc_eskf_init(void)
@@ -937,7 +949,9 @@ void proc_eskf_step(float dt_s, const float *gyro_dps, const float *gyro_lsb,
         return;
     }
 
+#ifdef PC_PROBE
     g_pc_ready = (float)s_eskf.ready; g_pc_calmag2 = (float)s_cal_n_mag; g_pc_valid2 = (float)s_eskf.valid;
+#endif
     if (s_eskf.ready == 0u) return;
 
     /* ★ 运行累计转角(rad)：驱动【系统性】标度误差的方差增长。
