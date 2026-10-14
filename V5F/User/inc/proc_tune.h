@@ -1,4 +1,4 @@
-﻿/* 处理链可调常量：集中一处，改这里就够。
+/* 处理链可调常量：集中一处，改这里就够。
  * 全部数值的实测依据见《地磁特性实验记录.md》与《地磁修正设计.md》。
  * 一律不做运行期 exp/sqrt 现算，表查/移位/比较为主。 */
 #ifndef PROC_TUNE_H
@@ -66,11 +66,15 @@ static inline float gyro_dps_per_lsb(int i)
 /* 器件零场偏置模长：本次实测 0.04233 G
  * 依据：六面标定面间散布 0.1955%，跨上电 0.07%，与姿态无关 */
 #define MAG_DEV_BIAS_G          0.0423f
-/* 器件零场偏置的体坐标方向（实测，用于逐轴扣除）
- * 若只用模长则无法扣向量，这里给出实测的单位方向 */
-#define MAG_DEV_BIAS_UX         0.52813f
-#define MAG_DEV_BIAS_UY        -0.34223f
-#define MAG_DEV_BIAS_UZ         0.77715f
+/* ★ 2026-10-14：器件零场偏置的体坐标方向（实测值，暂不参与计算）。
+ *   原为 #define MAG_DEV_BIAS_UX/UY/UZ，唯一使用者是 proc_mag.c 的 s_bias_u[3]，
+ *   而 s_bias_u 全仓 0 处引用 ⟹ 常量随之成为死定义，故改为注释保留。
+ *   现有实现按【逐相球心】扣零点，未做逐轴偏置方向扣除。
+ *   若将来启用逐轴扣除，恢复下面三行并在 proc_mag.c 重建 s_bias_u：
+ *     #define MAG_DEV_BIAS_UX         0.52813f
+ *     #define MAG_DEV_BIAS_UY        -0.34223f
+ *     #define MAG_DEV_BIAS_UZ         0.77715f
+ */
 
 /* LSM6DSV16X ±4000 dps 档：0.140 dps/LSB（本板源码 + 手册） */
 #define GYRO_DPS_PER_LSB        0.140f

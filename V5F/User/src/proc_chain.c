@@ -38,10 +38,13 @@ static uint32_t s_ekt_sum;
 static uint32_t s_ekt_max;
 static uint32_t s_ekt_min;
 static uint32_t s_ekt_last;
-static float    s_ekt_hz;
 
-/* 上报用的计时快照（us） */
-static float s_rep_last_us, s_rep_max_us, s_rep_avg_us, s_rep_hz;
+/* ★ 2026-10-14 删除以下 5 个变量（gcc -Wunused-variable，全仓均 0 处引用）：
+ *     static float    s_ekt_hz;
+ *     static float s_rep_last_us, s_rep_max_us, s_rep_avg_us, s_rep_hz;
+ *   上报已统一由 main.c 用 justfloat 裸帧完成，本文件的计时统计仅作内部度量，
+ *   这些"派生量/快照"从未被读取。若将来需要上报 EKF 耗时与上报率，恢复即可。
+ *   保留 s_ekt_min：它有实际读写（ekf_time_reset / ekf_time_add）。 */
 
 static void ekf_time_reset(void)
 {

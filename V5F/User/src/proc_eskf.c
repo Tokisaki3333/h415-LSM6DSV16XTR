@@ -583,7 +583,7 @@ static float eskf_update(const float *v_nav, const float *z, float r_perp, float
  * ★ 不得改成 q0=identity：PC 实测两者姿态差恒定 179.63°。 */
 static uint8_t eskf_build_q0(const float *a_mean, const float *u_mean)
 {    float zb[3], yb[3], xb[3], R0[9], um[3];
-    float na, nu, dp, ny, tr, w0, sn;
+    float na, nu, dp, ny, sn;
     uint8_t i;
 
     na = sqrtf(a_mean[0]*a_mean[0] + a_mean[1]*a_mean[1] + a_mean[2]*a_mean[2]);

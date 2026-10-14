@@ -217,7 +217,15 @@ uint8_t jf_dbg_push(float qw, float qx, float qy, float qz,
     return stage_frame(buf);
 }
 
-/* ---------------- ATT 帧：16 float = 64 B，恒定 ---------------- */
+/* ---------------- ATT 帧：16 float = 64 B，恒定 ----------------
+ * 逐 float 账（务必与 put_head 的实际写入一致）：
+ *   put_head 写 4 float：2 同步 + type + seq   = 16 B
+ *   数据     写 12 float                      = 48 B
+ *                             合计 16 float = 64 B
+ * ★ 2026-10-14 修正：原实现数据写了 14 float（合 18 float = 72 B），
+ *   超出 buf[JF_ATT_BYTES]=64 B ⟹ gcc -Wstringop-overflow 报 offset 64..71 越界写。
+ *   temp_raw / mag_err_deg 在本帧【无对应字段】，显式 (void) 丢弃；
+ *   eskf_ready 占用两字段中的第一个。 */
 uint8_t jf_att_push(float qw, float qx, float qy, float qz,
                     float bias_ok, float grav_err_deg,
                     float grav_applied, float mag_corr_en,
@@ -227,16 +235,17 @@ uint8_t jf_att_push(float qw, float qx, float qy, float qz,
     uint8_t buf[JF_ATT_BYTES];
     uint32_t o;
 
+    (void)temp_raw; (void)mag_err_deg;      /* 本帧无对应字段 */
+
     s_frame_bytes = JF_ATT_WIRE_BYTES;
 
-    o = put_head(buf, JF_TYPE_ATT);
+    o = put_head(buf, JF_TYPE_ATT);                       /* 4 float */
     o = put_f(buf, o, qw);           o = put_f(buf, o, qx);
     o = put_f(buf, o, qy);           o = put_f(buf, o, qz);
     o = put_f(buf, o, bias_ok);      o = put_f(buf, o, grav_err_deg);
     o = put_f(buf, o, grav_applied); o = put_f(buf, o, mag_corr_en);
     o = put_f(buf, o, imu_cnt);      o = put_f(buf, o, mmc_cnt);
-    o = put_f(buf, o, mmc_pol);      o = put_f(buf, o, temp_raw);
-    o = put_f(buf, o, mag_err_deg);  o = put_f(buf, o, eskf_ready);
+    o = put_f(buf, o, mmc_pol);      o = put_f(buf, o, eskf_ready);   /* 12 float */
     /* 帧长必须恰为 64 B（16 float × 4） */
     if (o != JF_ATT_BYTES)
     {

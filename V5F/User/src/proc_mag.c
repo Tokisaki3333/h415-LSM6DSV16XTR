@@ -57,9 +57,13 @@ static uint8_t  s_have_prev;            /* 是否已存有上一拍 */
 static uint32_t s_last_cnt;             /* 上次看到的 mmc 帧序号 */
 static uint32_t s_stall;                /* 连续无新数据的帧数 */
 
-static const float s_bias_u[3] = {      /* 器件零场偏置单位方向（实测） */
-    MAG_DEV_BIAS_UX, MAG_DEV_BIAS_UY, MAG_DEV_BIAS_UZ
-};
+/* ★ 2026-10-14 删除 s_bias_u[3]（器件零场偏置单位方向）。
+ *   它仅由 MAG_DEV_BIAS_UX/UY/UZ 初始化，全仓【0 处引用】⟹ gcc -Wunused-variable。
+ *   对应的三个实测常量在 proc_tune.h 中仍以注释保留（实测值，可回退），
+ *   但暂不参与计算：现有实现按【逐相球心】扣零点，未做逐轴偏置方向扣除。
+ *   若将来启用逐轴扣除，恢复本行即可：
+ *     static const float s_bias_u[3] = { MAG_DEV_BIAS_UX, MAG_DEV_BIAS_UY, MAG_DEV_BIAS_UZ };
+ */
 
 void proc_mag_init(void)
 {
